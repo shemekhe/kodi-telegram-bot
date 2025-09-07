@@ -1,0 +1,413 @@
+from __future__ import annotations
+
+import asyncio
+import os
+import time
+from typing import Callable, Awaitable, Any
+from telethon import events, Button, TelegramClient
+from telethon.tl.types import Document
+
+import config
+import kodi
+import utils
+from .state import DownloadState, CancelledDownload
+from .buttons import build_buttons
+from .progress import RateLimiter, create_progress_callback, wait_if_paused
+from .queue import queue, QueuedItem
+
+states: dict[str, DownloadState] = {}
+# _queue_started gates one‑time registration of queue worker & handlers
+_queue_started = False
+
+
+async def _safe_edit(msg, text: str, buttons=None):
+    try:
+        await msg.edit(text, buttons=buttons)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def filename_for_document(document: Document) -> str:
+    from telethon.tl.types import DocumentAttributeFilename
+    import mimetypes
+
+    for attr in document.attributes:
+        if isinstance(attr, DocumentAttributeFilename):
+            return attr.file_name
+    ext = mimetypes.guess_extension(getattr(document, "mime_type", "")) or ""
+    return f"media_{int(time.time())}{ext}"
+
+
+def validate_size(expected_size: int, path: str) -> bool:
+    return os.path.exists(path) and os.path.getsize(path) >= expected_size * 0.98
+
+
+async def pre_checks(event: events.NewMessage.Event):
+    document = event.document
+    if not utils.is_media_file(document):
+        await event.respond("⚠️ Only video and audio files are supported")
+        return None
+    filename = filename_for_document(document)
+    file_size = document.size or 0
+    path = os.path.join(config.DOWNLOAD_DIR, filename)
+    if not await _ensure_disk_space(event, filename, file_size):
+        return None
+    # Soft warning if approaching low space threshold
+    try:
+        if utils.free_disk_mb(config.DOWNLOAD_DIR) < config.DISK_WARNING_MB:
+            await event.respond(
+                f"⚠️ Low disk space (< {config.DISK_WARNING_MB}MB free). Consider cleaning up soon."
+            )
+    except Exception:  # noqa: BLE001
+        pass
+    if os.path.exists(path):
+        try:
+            actual = os.path.getsize(path)
+        except OSError:
+            actual = 0
+        if file_size == 0 or actual >= file_size * 0.98:
+            await event.respond(
+                f"ℹ️ File already exists: {filename} (size: {utils.humanize_size(actual)})"
+            )
+            return None
+        await event.respond(
+            f"⚠️ Found incomplete existing file ({utils.humanize_size(actual)}/{utils.humanize_size(file_size)}); re-downloading..."
+        )
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    return document, filename, file_size, path
+
+
+def _projected_free_mb(after_adding_bytes: int) -> int:
+    free_now = utils.free_disk_mb(config.DOWNLOAD_DIR)
+    return free_now - int(after_adding_bytes / (1024 * 1024))
+
+
+def _current_reserved_bytes() -> int:
+    # Sum expected sizes of all active states for safety.
+    return sum(st.size for st in states.values())
+
+
+async def _ensure_disk_space(event, filename: str, file_size: int) -> bool:
+    """Ensure that after accounting for active + this download we stay above threshold.
+
+    Strategy: reserve full size up-front for each running download. This is
+    conservative and simple (no partial progress accounting). Before starting
+    a queued item we re-run this check (see queue runner path below).
+    """
+    # bytes that would be reserved if this starts now
+    cumulative = _current_reserved_bytes() + file_size
+    projected = _projected_free_mb(cumulative)
+    if projected >= config.MIN_FREE_DISK_MB:
+        return True
+    # Attempt auto-clean to reach: min threshold + this file + current reserved
+    before = utils.free_disk_mb(config.DOWNLOAD_DIR)
+    target = config.MIN_FREE_DISK_MB + int(cumulative / (1024 * 1024))
+    deleted = utils.cleanup_old_files(config.DOWNLOAD_DIR, target)
+    after = utils.free_disk_mb(config.DOWNLOAD_DIR)
+    projected = _projected_free_mb(cumulative)
+    if projected >= config.MIN_FREE_DISK_MB:
+        await event.respond(
+            f"♻️ Auto-clean removed {deleted} file(s) (free {before}MB -> {after}MB). Proceeding."
+        )
+        return True
+    await event.respond(
+        (
+            f"🛑 Not enough disk space for {filename} (projected free {projected}MB) "
+            f"after reserving {utils.humanize_size(cumulative)}. Need >= {config.MIN_FREE_DISK_MB}MB free after all active downloads."
+        )
+    )
+    return False
+
+
+async def download_with_retries(
+    client: TelegramClient,
+    document: Document,
+    path: str,
+    progress_cb: Callable[[int, int], Awaitable[None]],
+    msg: Any,
+    state: DownloadState,
+) -> bool:
+    retry = 0
+    while retry <= config.MAX_RETRY_ATTEMPTS:
+        try:
+            if state.cancelled:
+                raise CancelledDownload
+            await wait_if_paused(state)
+            await client.download_media(document, file=path, progress_callback=progress_cb)
+            return True
+        except asyncio.TimeoutError:
+            retry += 1
+            if retry > config.MAX_RETRY_ATTEMPTS:
+                return False
+            await msg.edit(f"Download stalled. Retrying ({retry}/{config.MAX_RETRY_ATTEMPTS})...")
+            await asyncio.sleep(2)
+        except CancelledDownload:
+            return False
+
+
+def _final_cleanup(filename: str):
+    # Remove state after download finishes (success, error, or cancellation)
+    states.pop(filename, None)
+
+
+async def run_download(
+    client: TelegramClient,
+    event: events.NewMessage.Event,
+    document: Document,
+    filename: str,
+    file_size: int,
+    path: str,
+) -> None:
+    state = _init_state(filename, path, file_size)
+    msg = await _send_start_message(event, state)
+    progress_cb = create_progress_callback(filename, time.time(), RateLimiter(), msg, state)
+
+    try:
+        success = await download_with_retries(client, document, path, progress_cb, msg, state)
+        if not await _post_download_check(success, file_size, path, state, msg, filename):
+            return
+        await _handle_success(msg, filename, path)
+    except Exception as e:  # noqa: BLE001
+        await _handle_error(e, state, msg, filename, path)
+    finally:
+        _final_cleanup(filename)
+
+
+def _init_state(filename: str, path: str, size: int) -> DownloadState:
+    st = DownloadState(filename, path, size)
+    states[filename] = st
+    return st
+
+
+async def _send_start_message(event: events.NewMessage.Event, state: DownloadState):
+    msg = await event.respond(
+        f"Starting download of {state.filename}...", buttons=build_buttons(state)
+    )
+    state.message = msg
+    state.last_text = msg.raw_text
+    kodi.notify("Download Started", state.filename)
+    return msg
+
+
+async def _post_download_check(
+    success: bool,
+    expected_size: int,
+    path: str,
+    state: DownloadState,
+    msg,
+    filename: str,
+) -> bool:
+    if success and validate_size(expected_size, path):
+        return True
+    if state.cancelled:
+        await _safe_edit(msg, f"🛑 Download cancelled: {filename}")
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    else:
+        await _safe_edit(
+            msg,
+            f"❌ Download incomplete. Expected {utils.humanize_size(expected_size)}",
+        )
+        kodi.notify("Download Failed", f"Incomplete: {filename}")
+    return False
+
+
+async def _handle_success(msg, filename: str, path: str) -> None:
+    playing = kodi.is_playing()
+    if playing:
+        text = (
+            f"✅ Download complete: {filename}\n"
+            "Kodi playing something else. File ready."
+        )
+    else:
+        text = f"✅ Download complete: {filename}\nPlaying on Kodi..."
+    await _safe_edit(msg, text)
+    if not playing:
+        kodi.play(path)
+    kodi.notify("Download Complete", filename)
+
+
+async def _handle_error(
+    exc: Exception,
+    state: DownloadState,
+    msg,
+    filename: str,
+    path: str,
+) -> None:
+    if state.cancelled:
+        await _safe_edit(msg, f"🛑 Download cancelled: {filename}")
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        return
+    err = str(exc)
+    await _safe_edit(msg, f"❌ Error: {err[:200]}")
+    kodi.notify("Download Failed", err[:50])
+
+
+def register_handlers(client: TelegramClient):
+    """Register Telegram handlers and start queue worker."""
+    global _queue_started
+    if not _queue_started:
+        queue.set_runner(
+            lambda c, qi: run_download(
+                c, qi.event, qi.document, qi.filename, qi.size, qi.path
+            )
+        )
+        queue.ensure_worker(client.loop, client)
+        _queue_started = True
+
+    _register_download_handler(client)
+    _register_status_handler(client)
+    _register_start_handler(client)
+    _register_control_callbacks(client)
+    client.loop.create_task(_register_bot_commands(client))
+
+
+def _register_download_handler(client: TelegramClient):
+    @client.on(events.NewMessage(func=lambda e: e.is_private and e.document))
+    async def _download(event):  # noqa: D401
+        pre = await pre_checks(event)
+        if not pre:
+            return
+        document, filename, size, path = pre
+        if queue.is_saturated():
+            position = queue._queue.qsize() + 1  # type: ignore[attr-defined]
+            qi = QueuedItem(filename, document, size, path, event)
+            msg = await event.respond(
+                (
+                    f"🕒 Queued #{position}: {filename}\n"\
+                    f"Waiting for free slot (limit {config.MAX_CONCURRENT_DOWNLOADS})"
+                ),
+                buttons=[[Button.inline("🛑 Cancel", data=f"qcancel:{filename}")]],
+            )
+            qi.message = msg
+            await queue.enqueue(qi)
+        else:
+            # Acquire slot manually for immediate execution. Re-check disk with concurrency prediction
+            async with queue.slot():  # pragma: no cover - thin wrapper
+                if not await _ensure_disk_space(event, filename, size):
+                    return
+                await run_download(client, event, document, filename, size, path)
+
+
+def _register_status_handler(client: TelegramClient):
+    @client.on(
+        events.NewMessage(
+            func=lambda e: e.is_private
+            and not e.document
+            and (e.raw_text or "").strip().lower() == "/status"
+        )
+    )
+    async def _status(event):  # noqa: D401
+        q = list(queue.items.keys())
+        active = list(states.keys())
+        parts = [
+            f"Active: {len(active)}/{config.MAX_CONCURRENT_DOWNLOADS}",
+            f"Queued: {len(q)}",
+        ]
+        if active:
+            parts.append("\nCurrent downloads:")
+            parts.extend(f" • {fn}" for fn in active[:10])
+        if q:
+            parts.append("\nQueue:")
+            parts.extend(f" {i+1}. {fn}" for i, fn in enumerate(q[:15]))
+        await event.respond("\n".join(parts))
+
+
+def _register_start_handler(client: TelegramClient):
+    HELP_TEXT = (
+        "Send me a video or audio file — I'll download it and play it on Kodi.\n\n"
+        "Commands:\n/status – show active + queued downloads\n/start – this help\n\n"
+        "Use buttons to Pause / Resume / Cancel during a download.\n"
+        "Skips if disk would drop below MIN_FREE_DISK_MB (auto-clean may free space)."
+    )
+
+    @client.on(
+        events.NewMessage(
+            func=lambda e: e.is_private and (e.raw_text or "").strip().lower() == "/start"
+        )
+    )
+    async def _start(event):  # noqa: D401
+        await event.respond(HELP_TEXT)
+
+
+async def _register_bot_commands(client: TelegramClient):
+    try:
+        from telethon.tl.functions.bots import SetBotCommandsRequest
+        from telethon.tl.types import BotCommand
+    except Exception:  # noqa: BLE001
+        return
+    commands = [
+        BotCommand("start", "Help / usage"),
+        BotCommand("status", "Show downloads"),
+    ]
+    try:
+        await client(SetBotCommandsRequest(commands=commands))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _register_control_callbacks(client: TelegramClient):
+    _register_pause_resume_cancel(client)
+    _register_qcancel(client)
+
+
+def _register_pause_resume_cancel(client: TelegramClient):
+    pattern = b"(pause|resume|cancel):"
+
+    @client.on(events.CallbackQuery(pattern=pattern))
+    async def _prc(event):  # noqa: D401
+        action, filename = event.data.decode().split(":", 1)
+        st = states.get(filename)
+        if not st or st.cancelled:
+            await event.answer("Not available", alert=False)
+            return
+        if action == "pause":
+            if st.paused:
+                await event.answer("Already paused", alert=False)
+                return
+            st.mark_paused()
+            await _safe_edit(st.message, st.message.raw_text, buttons=build_buttons(st))
+            await event.answer("Paused")
+        elif action == "resume":
+            if not st.paused:
+                await event.answer("Not paused", alert=False)
+                return
+            st.mark_resumed()
+            await _safe_edit(st.message, f"▶ Resuming: {st.filename}", buttons=build_buttons(st))
+            await event.answer("Resuming")
+        else:  # cancel
+            st.mark_cancelled()
+            await _safe_edit(st.message, f"🛑 Cancelling: {st.filename}")
+            await event.answer("Cancelling")
+
+
+def _register_qcancel(client: TelegramClient):
+    @client.on(events.CallbackQuery(pattern=b"qcancel:"))
+    async def _qcancel(event):  # noqa: D401
+        filename = event.data.decode().split(":", 1)[1]
+        qi = queue.items.get(filename)
+        if not (qi and not qi.cancelled):
+            await event.answer("Not found", alert=False)
+            return
+        queue.cancel(filename)
+        try:
+            if qi.message:
+                await qi.message.edit(f"🛑 Cancelled (queued): {filename}")
+        except Exception:  # noqa: BLE001
+            pass
+        await event.answer("Cancelled")
+
+__all__ = [
+    "register_handlers",
+    "run_download",
+]

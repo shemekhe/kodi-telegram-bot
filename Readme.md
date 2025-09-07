@@ -1,0 +1,297 @@
+<div align="center">
+ 
+# Kodi Telegram Bot
+
+Lightweight Telegram bot that downloads video / audio you send it and plays the file on a Kodi instance. Built to be tiny, readable and Raspberry‑Pi friendly.
+
+<p>
+<em>No databases. No tracking. One process.</em>
+</p>
+
+</div>
+
+## Table of Contents
+
+1. What It Does
+2. Features
+3. Architecture at a Glance
+4. Quick Start
+5. Environment Variables
+6. Usage & Controls
+7. Disk Space & Auto‑Clean
+8. Raspberry Pi Deployment (systemd)
+9. Contributing
+10. Troubleshooting
+11. License
+
+## 1. What It Does
+
+Private‑chat the bot a media file (video/audio). It:
+1. Validates it looks like playable media.
+2. Ensures post‑download free disk space stays above a safety threshold (auto‑clean oldest files if needed).
+3. Queues or starts download (with concurrency limit).
+4. Shows progress (Telegram + optional Kodi notifications).
+5. On completion, plays it on Kodi unless Kodi is already playing something (then just stores it).
+
+## 2. Features
+
+- ✅ Video & audio detection via MIME, Telethon attributes & extension fallbacks
+- 🚦 Concurrency limit + FIFO queue with per‑item cancellation
+- ⏯ Inline buttons: Pause / Resume / Cancel
+- 🔁 Retry on transient timeouts (configurable attempts)
+- ♻️ Auto clean oldest files when space low (non‑recursive, top directory only)
+- 🛡 Disk + memory safety checks with gentle warnings
+- 📊 Kodi progress notifications (rate‑limited) when idle
+- 🔔 Minimal startup & error notifications (no log spam)
+- 🧱 Small, modular codebase: easy to read & fork
+
+Non‑goals: partial resume of interrupted downloads; database persistence; public group handling.
+
+## 3. Architecture at a Glance
+
+```
+main.py            -> startup, graceful shutdown
+config.py          -> env loading & validation
+utils.py           -> media detection, disk/memory helpers
+kodi.py            -> tiny JSON‑RPC wrapper (notify / play / status)
+downloader/
+   queue.py         -> concurrency + FIFO queue worker
+   state.py         -> DownloadState (pause/resume/cancel flags)
+   buttons.py       -> inline keyboard builder
+   progress.py      -> rate‑limited progress callback factory
+   manager.py       -> orchestration: handlers, retries, success/error flows
+```
+
+Everything is in‑memory; restart is safe (partially downloaded files <98% are re‑fetched).
+
+## 4. Quick Start
+
+```bash
+git clone https://github.com/shemekhe/kodi-telegram-bot.git
+cd kodi-telegram-bot
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env   # fill in Telegram + Kodi values
+python main.py
+```
+
+Send the bot a video or audio file in a private chat. Use `/status` anytime.
+
+## 5. Environment Variables
+
+Create a Telegram app (API ID / HASH) at https://my.telegram.org and a bot token via @BotFather.
+
+Minimal required:
+```
+TELEGRAM_API_ID=123456
+TELEGRAM_API_HASH=your_hash
+TELEGRAM_BOT_TOKEN=12345:bot_token
+```
+
+Common config (see `.env.example`):
+```
+KODI_URL=http://localhost:8080/jsonrpc
+KODI_USERNAME=kodi
+KODI_PASSWORD=your_pass
+DOWNLOAD_DIR=~/Downloads
+MAX_RETRY_ATTEMPTS=3
+MAX_CONCURRENT_DOWNLOADS=5
+MIN_FREE_DISK_MB=200      # hard stop if projected below
+DISK_WARNING_MB=500       # soft warning only
+MEMORY_WARNING_PERCENT=90 # Kodi popup if exceeded (0 disables)
+```
+`MEMORY_WARNING_PERCENT=0` disables memory popups.
+
+## Creating Your Telegram Bot (Detail)
+
+1. Open Telegram and start a chat with **@BotFather**.
+2. Send `/newbot` and follow the prompts (choose a name + unique username ending in `bot`).
+3. BotFather returns an HTTP API token – set this as `TELEGRAM_BOT_TOKEN` in your `.env`.
+4. (Optional) Set a profile picture with `/setuserpic` and a description with `/setdescription`.
+5. Keep the token secret; regenerate with `/revoke` if leaked.
+
+Environment variables needed from this step:
+```
+TELEGRAM_API_ID=your_api_id
+TELEGRAM_API_HASH=your_api_hash
+TELEGRAM_BOT_TOKEN=the_token_from_botfather
+```
+You can obtain API ID/HASH at https://my.telegram.org (create an application). These differ from the bot token.
+
+_Duplicate of feature bullets removed for brevity; see section 2._
+
+## Requirements
+
+- Python 3.10+ (tested on 3.12)  
+- Telegram API ID / Hash + bot token  
+- Kodi with JSON‑RPC (remote control via HTTP) enabled  
+- Works well on Raspberry Pi (3 or newer)
+
+## Kodi Configuration (Remote Control)
+
+Before running the bot, make sure Kodi allows remote control over HTTP:
+
+1. On your Kodi device open: Settings (gear icon) > Services > Control
+2. Enable: "Allow remote control via HTTP"
+3. (Optional but recommended) Set the port (default 8080), username, and password
+4. Also enable: "Allow remote control from applications on other systems"
+
+Match the chosen username/password/port with your `.env` values (`KODI_URL`, `KODI_USERNAME`, `KODI_PASSWORD`). Without this, the bot can’t send play or notification commands.
+
+## 6. Usage & Controls
+
+Run: `python main.py`
+
+Bot actions:
+1. Startup notification to Kodi (optional failure logged to stdout).
+2. Accepts only private messages with a document (video/audio). Others ignored unless `/start` or `/status`.
+3. If busy beyond concurrency limit -> place into queue with position number.
+
+Inline controls during active download:
+
+- ⏸ Pause – temporarily halts; can resume from same offset.
+- ▶ Resume – continues download.
+- 🛑 Cancel – aborts and deletes partial file.
+
+Commands:
+`/start` help text  
+`/status` active + queued summary  
+
+If the bot was offline for a long time you may need to resend older files.
+
+### Concurrency & Queue
+Active downloads <= `MAX_CONCURRENT_DOWNLOADS`; extra items wait. The `/status` output lists active first, then queued. Queued items expose a Cancel button (labelled "Cancelled (queued)" when removed).
+
+### Restart Behavior
+On restart any partial files <98% complete are deleted & re‑downloaded when resent. Completed files can be re‑played by sending them again (Kodi will just play existing file if unchanged).
+
+## 7. Disk Space & Auto‑Clean
+
+Each download is allowed only if predicted free space after completion stays above `MIN_FREE_DISK_MB`.
+If not, the bot automatically deletes the oldest files (top level of `DOWNLOAD_DIR`) until the requirement is met. If still not enough, the download is refused. A soft warning is shown when free space drops below `DISK_WARNING_MB`.
+
+## 8. Raspberry Pi Setup
+
+Optimized for Raspberry Pi (Pi 3 or later recommended). Below is a concise, production-friendly setup.
+
+### 1. OS & Packages
+```sh
+sudo apt update
+sudo apt install -y python3 python3-venv git
+```
+
+### 2. Clone & Install
+```sh
+cd /home/pi
+git clone https://github.com/shemekhe/kodi-telegram-bot.git
+cd kodi-telegram-bot
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+cp .env.example .env  # then edit .env with your values
+```
+
+Edit `.env` and set your Telegram + Kodi values. Ensure `DOWNLOAD_DIR` exists or let the app create it.
+
+### 3. systemd Service
+Create the service file:
+```sh
+sudo nano /etc/systemd/system/kodi-telegram-bot.service
+```
+
+Paste (adjust paths if you used a different location):
+```ini
+[Unit]
+Description=Kodi Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/kodi-telegram-bot
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/home/pi/kodi-telegram-bot/.env
+ExecStart=/home/pi/kodi-telegram-bot/.venv/bin/python main.py
+Restart=on-failure
+RestartSec=5
+
+# (Optional hardening — relax if it causes issues)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable & start:
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable kodi-telegram-bot
+sudo systemctl start kodi-telegram-bot
+```
+
+### 4. Logs & Maintenance
+```sh
+journalctl -u kodi-telegram-bot -f    # live logs
+sudo systemctl restart kodi-telegram-bot
+sudo systemctl status kodi-telegram-bot
+```
+
+Update to latest version:
+```sh
+cd /home/pi/kodi-telegram-bot
+git pull
+source .venv/bin/activate
+pip install -r requirements.txt
+sudo systemctl restart kodi-telegram-bot
+```
+
+### 5. File Storage Considerations
+- Use an external drive for large media: set `DOWNLOAD_DIR` to the mounted path (e.g. `/mnt/media`).
+- Ensure the `pi` user has write permissions on that path.
+- Monitor space: `df -h`.
+
+### 6. Optional Optimization
+- Add swap if memory constrained (but SSD wear risk).
+- Use `ionice` / `nice` wrappers if downloads compete with playback (advanced).
+
+You now have an auto‑starting bot instance.
+
+## 9. Contributing
+
+PRs and small improvements welcome. Suggested first issues:
+- Add tests for a missing edge case (see `tests/` for style)
+- Improve docs / examples
+- Add optional logging verbosity flag
+
+Guidelines:
+1. Keep functions small & side‑effect light.
+2. Avoid adding heavy dependencies.
+3. Run `pytest -q` before submitting.
+4. Prefer clarity over cleverness.
+
+No formal Code of Conduct yet; be respectful.
+
+## 10. Troubleshooting
+
+Issue | Things to Check
+----- | ----------------
+Kodi not playing | JSON‑RPC enabled? Correct URL / credentials? Port reachable?
+Bot silent | Is it a private chat? Did you send a *file* (not a streaming link)?
+Stuck queued | Concurrency limit reached; lower file count or raise limit.
+Always low space | Increase `MIN_FREE_DISK_MB` cautiously or clean directory.
+Memory warnings | Set `MEMORY_WARNING_PERCENT=0` to disable.
+
+Logging is intentionally minimal; feel free to add temporary prints while debugging.
+
+## 11. License
+
+MIT — do what you like; attribution appreciated. No warranty.
+
+---
+
+Happy hacking. If this helped you, a ⭐ on the repo helps others find it.
