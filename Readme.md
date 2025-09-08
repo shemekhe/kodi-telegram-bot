@@ -39,7 +39,9 @@ Private‑chat the bot a media file (video/audio). It:
 - 🚦 Concurrency limit + FIFO queue with per‑item cancellation
 - ⏯ Inline buttons: Pause / Resume / Cancel
 - 🔁 Retry on transient timeouts (configurable attempts)
-- ♻️ Auto clean oldest files when space low (non‑recursive, top directory only)
+- ♻️ Auto clean oldest files when space low (now recursive through organized subfolders)
+- 🗂 Automatic media organization (Movies / Series / Other) with smart filename normalization
+- 🎛 Category selection buttons for ambiguous uploads (choose Movie / Series / Other)
 - 🛡 Disk + memory safety checks with gentle warnings
 - 📊 Kodi progress notifications (rate‑limited) when idle
 - 🔔 Minimal startup & error notifications (no log spam)
@@ -60,6 +62,7 @@ downloader/
    buttons.py       -> inline keyboard builder
    progress.py      -> rate‑limited progress callback factory
    manager.py       -> orchestration: handlers, retries, success/error flows
+organizer.py       -> filename parsing, categorization & final path builder
 ```
 
 Everything is in‑memory; restart is safe (partially downloaded files <98% are re‑fetched).
@@ -99,8 +102,11 @@ MAX_CONCURRENT_DOWNLOADS=5
 MIN_FREE_DISK_MB=200      # hard stop if projected below
 DISK_WARNING_MB=500       # soft warning only
 MEMORY_WARNING_PERCENT=90 # Kodi popup if exceeded (0 disables)
+ORGANIZE_MEDIA=1          # enable structured Movies/Series/Other layout (default 1)
 ```
 `MEMORY_WARNING_PERCENT=0` disables memory popups.
+
+`ORGANIZE_MEDIA=0` stores files flat directly inside `DOWNLOAD_DIR` (no subfolders, original Telegram filename).
 
 ## Creating Your Telegram Bot (Detail)
 
@@ -159,6 +165,40 @@ Commands:
 
 If the bot was offline for a long time you may need to resend older files.
 
+### Media Organization & Naming
+
+Enabled by default (`ORGANIZE_MEDIA=1`). Incoming filenames are parsed heuristically:
+
+1. Detect series tokens like `S02E06`, `SO4E24` (some releases use `O` instead of `0`).
+2. Detect a year token (e.g. `2024`) to classify as a Movie when no series token exists.
+3. Strip common quality / codec / group tags (e.g. `1080p`, `WEB-DL`, `x265`, `YTS`, `Farsi`, release group names).
+4. Normalize dots/underscores into spaces, capitalize words, and build final names.
+
+Resulting structure examples:
+
+```
+Movies/
+   Bullet Train (2022)/
+      Bullet Train (2022).mkv
+
+Series/
+   The Mentalist (2008)/
+      Season 4/
+         The Mentalist S04E24.mkv
+```
+
+If classification is ambiguous (looks like a movie because it has a year but parser can’t be sure) you’ll get inline buttons:
+`🎬 Movie` · `📺 Series` · `📁 Other`
+
+Selecting one forces the directory choice without re‑uploading.
+
+Other / unknown files (no year & no season/episode pattern) go under:
+```
+Other/<OriginalFileName.ext>
+```
+
+Disable the whole feature with `ORGANIZE_MEDIA=0` to revert to flat storage.
+
 ### Concurrency & Queue
 Active downloads <= `MAX_CONCURRENT_DOWNLOADS`; extra items wait. The `/status` output lists active first, then queued. Queued items expose a Cancel button (labelled "Cancelled (queued)" when removed).
 
@@ -168,7 +208,7 @@ On restart any partial files <98% complete are deleted & re‑downloaded when re
 ## 7. Disk Space & Auto‑Clean
 
 Each download is allowed only if predicted free space after completion stays above `MIN_FREE_DISK_MB`.
-If not, the bot automatically deletes the oldest files (top level of `DOWNLOAD_DIR`) until the requirement is met. If still not enough, the download is refused. A soft warning is shown when free space drops below `DISK_WARNING_MB`.
+If not, the bot automatically deletes the oldest files (recursive across Movies/Series/Other) until the requirement is met. If still not enough, the download is refused. A soft warning is shown when free space drops below `DISK_WARNING_MB`.
 
 ## 8. Raspberry Pi Setup
 

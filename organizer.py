@@ -1,0 +1,256 @@
+"""Media file categorization & path builder.
+
+Environment driven (see config) lightweight organizer that:
+ - Classifies filename as movie / series / other.
+ - Normalizes title tokens (replace dots/underscores, trim junk tags).
+ - Builds human friendly final path under configured subdirectories.
+
+Parsing heuristics are intentionally simple + deterministic (no network).
+If classification is ambiguous caller can ask user; this module only provides
+pure functions so it's easy to test.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+import os
+import re
+from typing import Iterable, List, Tuple
+
+import config
+
+_YEAR_RE = re.compile(r"^(19\d{2}|20\d{2}|21\d{2})$")  # conservative upper bound
+
+# Core patterns we will try in order for series tokens
+_PAT_SXXEYY_MULTI = re.compile(r"^[Ss]([0O]?\d{1,2})E(\d{2})(?:E\d{2}|-\d{2})+$")  # S02E05E06 / S02E05-06 (take first)
+_PAT_SXXEYY = re.compile(r"^[Ss]([0O]?\d{1,2})E(\d{1,2})$")  # S02E5 or S2E05 variants
+_PAT_SEP_X = re.compile(r"^(\d{1,2})[xX](\d{1,2})$")  # 1x05 / 2x5
+_PAT_NUM3 = re.compile(r"^(\d)(\d{2})$")  # 205 => S02E05 heuristic (avoid years)
+
+# Accept tokens like SO4E24 (letter O as 0) by normalizing O->0 in season part.
+def _normalize_season_digits(raw: str) -> str:
+    return raw.upper().replace('O', '0')
+
+# Common technical / quality / group tokens (lower‑case) stripped from titles
+_JUNK = {
+    # Resolutions / quality
+    "1080p", "720p", "480p", "2160p", "1440p", "360p", "4k", "8k", "10bit", "uhd", "hdr", "hdr10", "hdr10plus", "dv", "dovi", "sdr",
+    # Sources / codecs
+    "webrip", "web", "web-dl", "bluray", "brrip", "hdrip", "dvdrip", "hdtv", "x264", "x265", "h264", "h265", "avc", "hevc", "xvid", "remux",
+    # Audio / channels
+    "aac", "dd5", "dd5.1", "ddp5", "ddp5.1", "dts", "atmos", "truehd", "ac3", "mp3", "flac", "6ch", "8ch",
+    # Release / language / misc tags
+    "multi", "farsi", "dubbed", "dual", "audio", "subs", "esubs", "hc", "proper", "repack", "internal", "extended", "cut", "uncut", "unrated", "imax", "colorized",
+    # Groups / common scene names
+    "pahe", "yts", "rarbg", "galaxyrg", "alphadl", "lama", "psa", "ntb", "evo", "tgx", "fg0", "geckos", "cmrg", "amzn",
+    # Misc ephemeral
+    "sample", "ad",
+}
+
+# Edition tokens we might *optionally* keep to append after title (normalized form)
+_EDITION_KEEP = {"extended", "remastered", "unrated", "imax", "directors", "director", "ultimate"}
+
+
+@dataclass(slots=True)
+class ParsedMedia:
+    category: str  # movie|series|other|unknown
+    title: str  # movie title or series episode show title
+    year: int | None = None
+    season: int | None = None
+    episode: int | None = None
+    # Final normalized filename (without directory) suggestion (no extension)
+    normalized_stem: str | None = None
+    edition: str | None = None  # e.g. Extended, Remastered (movies only currently)
+
+
+def _tokenize(name: str) -> List[str]:
+    # Remove extension beforehand
+    name = name.replace("_", ".")  # treat underscore as dot separator
+    # Remove duplicate dots
+    name = re.sub(r"\.+", ".", name)
+    # Trim leading/trailing dots
+    name = name.strip('.')
+    return [t for t in name.split('.') if t]
+
+
+def _clean_tokens(tokens: Iterable[str]) -> List[str]:
+    out: List[str] = []
+    for t in tokens:
+        low = t.lower()
+        if low in _JUNK:
+            continue
+        if re.fullmatch(r"\d+ch", low):
+            continue
+        # Strip obvious release group token if it's the very last and made only of letters/numbers (common pattern)
+        out.append(t)
+    return out
+
+
+def _norm_word(w: str) -> str:
+    if not w:
+        return w
+    if w.isupper() and len(w) <= 4:  # short all‑caps -> keep
+        return w
+    return w.capitalize()
+
+
+def _build_title(tokens: List[str]) -> str:
+    return re.sub(r"\s+", " ", " ".join(_norm_word(t) for t in tokens).strip())
+
+
+def _detect_year(tokens: List[str]) -> tuple[int | None, int]:
+    for i, tok in enumerate(tokens):
+        if _YEAR_RE.match(tok):
+            return int(tok), i
+    return None, -1
+
+
+def _detect_series(tokens: List[str]) -> tuple[int | None, int | None, int]:
+    for i, tok in enumerate(tokens):
+        t = tok
+        # Multi-episode SxxEyyEzz
+        if _PAT_SXXEYY_MULTI.match(t):
+            m = _PAT_SXXEYY.match(t[:t.upper().find('E', 2) + 3])  # first part
+            if m:
+                season = int(_normalize_season_digits(m.group(1)))
+                episode = int(m.group(2))
+                return season, episode, i
+        m = _PAT_SXXEYY.match(t)
+        if m:
+            season = int(_normalize_season_digits(m.group(1)))
+            episode = int(m.group(2))
+            return season, episode, i
+        mx = _PAT_SEP_X.match(t)
+        if mx:
+            season = int(mx.group(1))
+            episode = int(mx.group(2))
+            return season, episode, i
+        m3 = _PAT_NUM3.match(t)
+        if m3:
+            season = int(m3.group(1))
+            episode = int(m3.group(2))
+            if episode < 60:  # heuristic safety
+                return season, episode, i
+    return None, None, -1
+
+
+def _extract_edition(tokens: List[str]) -> tuple[str | None, List[str]]:
+    # Look for edition keywords near the end (before junk removal) e.g. Extended, Remastered
+    edition_tokens: List[str] = []
+    remaining = []
+    for t in tokens:
+        low = t.lower()
+        if low in _EDITION_KEEP:
+            # Avoid duplicates / combine consecutive
+            if low not in (et.lower() for et in edition_tokens):
+                edition_tokens.append(t)
+            continue
+        remaining.append(t)
+    edition = None
+    if edition_tokens:
+        # Normalize ordering (Extended Remastered etc.)
+        edition = " ".join(_norm_word(e) for e in edition_tokens)
+    return edition, remaining
+
+
+def parse_filename(filename: str) -> ParsedMedia:
+    stem, _ext = os.path.splitext(filename)
+    # Handle trailing duplicate suffix like _1
+    stem = re.sub(r"_(\d+)$", "", stem)
+    tokens = _tokenize(stem)
+    if not tokens:
+        return ParsedMedia("unknown", filename)
+
+    year, year_index = _detect_year(tokens)
+    season, episode, series_index = _detect_series(tokens)
+
+    edition, base_tokens = _extract_edition(tokens)
+
+    # Replace tokens list with edition-stripped version for title building logic
+    tokens = base_tokens
+    # Adjust indexes if edition tokens removed before indexes (simpler: recompute)
+    if season is not None or episode is not None:
+        season, episode, series_index = _detect_series(tokens)
+    if year is not None:
+        year, year_index = _detect_year(tokens)
+
+    if series_index != -1 and season is not None and episode is not None:
+        show_tokens = tokens[:series_index]
+        show_year = None
+        if year_index != -1 and year_index < series_index:
+            show_year = year
+            show_tokens = [t for i, t in enumerate(show_tokens) if i != year_index]
+        cleaned = _clean_tokens(show_tokens)
+        title = _build_title(cleaned or show_tokens)
+        norm_stem = f"{title} S{season:02d}E{episode:02d}"
+        return ParsedMedia("series", title, show_year, season, episode, norm_stem, edition)
+
+    if year is not None and year_index > 0:
+        title_tokens = tokens[:year_index]
+        cleaned = _clean_tokens(title_tokens)
+        base_title = _build_title(cleaned or title_tokens)
+        # Append edition if present
+        title = base_title
+        norm_title = base_title
+        if edition:
+            title = f"{base_title} {edition}"
+            norm_title = base_title  # Do not put edition inside folder parentheses stem
+        norm_stem = f"{norm_title} ({year})"
+        return ParsedMedia("movie", title, year, None, None, norm_stem, edition)
+
+    cleaned_all = _clean_tokens(tokens)
+    title = _build_title(cleaned_all or tokens)
+    return ParsedMedia("other", title, None, None, None, None, edition)
+
+
+def build_final_path(filename: str, base_dir: str | None = None, forced_category: str | None = None) -> Tuple[str, str]:
+    """Return (final_path, final_filename).
+
+    If organization disabled returns original path/filename.
+    """
+    base_dir = base_dir or config.DOWNLOAD_DIR
+    if not config.ORGANIZE_MEDIA:
+        return os.path.join(base_dir, filename), filename
+
+    parsed = parse_filename(filename)
+    if forced_category:
+        # Allow manual override when heuristics failed.
+        if forced_category in {"movie", "series", "other"}:
+            parsed.category = forced_category  # type: ignore[misc]
+            # Synthesize minimal normalized stem if missing for movie/series
+            if forced_category == "movie" and not parsed.normalized_stem:
+                base_title = parsed.title or os.path.splitext(filename)[0]
+                parsed.normalized_stem = f"{base_title}"
+            if forced_category == "series" and not parsed.normalized_stem:
+                base_title = parsed.title or os.path.splitext(filename)[0]
+                parsed.normalized_stem = f"{base_title} S01E01"
+                parsed.season = parsed.season or 1
+                parsed.episode = parsed.episode or 1
+    ext = os.path.splitext(filename)[1]
+
+    if parsed.category == "movie" and parsed.normalized_stem:
+        movies_root = os.path.join(base_dir, config.MOVIES_DIR_NAME)
+        folder = f"{parsed.normalized_stem}"  # stem already '(Year)'
+        final_dir = os.path.join(movies_root, folder)
+        os.makedirs(final_dir, exist_ok=True)
+        final_name = f"{parsed.normalized_stem}{ext}"
+        return os.path.join(final_dir, final_name), final_name
+    if parsed.category == "series" and parsed.normalized_stem:
+        series_root = os.path.join(base_dir, config.SERIES_DIR_NAME)
+        show_folder = parsed.title if not parsed.year else f"{parsed.title} ({parsed.year})"
+        season_folder = f"Season {parsed.season}" if parsed.season else "Season 1"
+        final_dir = os.path.join(series_root, show_folder, season_folder)
+        os.makedirs(final_dir, exist_ok=True)
+        final_name = f"{parsed.normalized_stem}{ext}"
+        return os.path.join(final_dir, final_name), final_name
+
+    # OTHER / unknown: place under OTHER dir (if enabled) else root
+    other_root = os.path.join(base_dir, config.OTHER_DIR_NAME)
+    os.makedirs(other_root, exist_ok=True)
+    return os.path.join(other_root, filename), filename
+
+
+__all__ = [
+    "ParsedMedia",
+    "parse_filename",
+    "build_final_path",
+]

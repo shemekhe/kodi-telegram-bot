@@ -31,6 +31,14 @@ _RAW_DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "~/Downloads")
 DOWNLOAD_DIR = os.path.expanduser(os.path.expandvars(_RAW_DOWNLOAD_DIR))
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
+# Media organization feature flag.
+# Only toggle is ORGANIZE_MEDIA (defaults ON). Folder names are fixed constants
+# to keep layout predictable and portable (not overridden by env vars).
+ORGANIZE_MEDIA: bool = os.getenv("ORGANIZE_MEDIA", "1").lower() in {"1", "true", "yes", "on"}
+MOVIES_DIR_NAME: str = "Movies"
+SERIES_DIR_NAME: str = "Series"
+OTHER_DIR_NAME: str = "Other"
+
 MAX_RETRY_ATTEMPTS: int = _env_int("MAX_RETRY_ATTEMPTS", 3)
 MAX_CONCURRENT_DOWNLOADS: int = _env_int("MAX_CONCURRENT_DOWNLOADS", 5)
 MIN_FREE_DISK_MB: int = _env_int("MIN_FREE_DISK_MB", 200)
@@ -52,6 +60,10 @@ __all__ = [
     "KODI_AUTH",
     "HEADERS",
     "DOWNLOAD_DIR",
+    "ORGANIZE_MEDIA",
+    "MOVIES_DIR_NAME",
+    "SERIES_DIR_NAME",
+    "OTHER_DIR_NAME",
     "MAX_RETRY_ATTEMPTS",
     "MAX_CONCURRENT_DOWNLOADS",
     "MIN_FREE_DISK_MB",

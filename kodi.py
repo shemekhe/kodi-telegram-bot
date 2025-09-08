@@ -5,34 +5,43 @@ import requests
 from typing import Any
 
 import config
+from logger import log
 
 
 def _rpc(method: str, params: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    payload = {"jsonrpc": "2.0", "method": method, "params": params or {}, "id": 1}
     try:
-        payload = {"jsonrpc": "2.0", "method": method, "params": params or {}, "id": 1}
         r = requests.post(
-            config.KODI_URL, headers=config.HEADERS, json=payload, auth=config.KODI_AUTH, timeout=5
+            config.KODI_URL,
+            headers=config.HEADERS,
+            json=payload,
+            auth=config.KODI_AUTH,
+            timeout=5,
         )
-        return r.json()
-    except Exception as e:  # noqa: E722  (broad except acceptable here for logging)
-        print(f"Kodi RPC error ({method}): {e}")
+        data = r.json()
+        if r.status_code != 200:
+            log.warning("Kodi RPC non-200 (%s) method=%s", r.status_code, method)
+        return data
+    except Exception as e:  # noqa: E722
+        log.error("Kodi RPC error (%s): %s", method, e)
         return None
 
 
 def notify(title: str, message: str) -> None:
-    _rpc(
-        "GUI.ShowNotification",
-        {"title": title, "message": message, "displaytime": 2000},
-    )
+    log.debug("Notify: %s - %s", title, message)
+    _rpc("GUI.ShowNotification", {"title": title, "message": message, "displaytime": 2000})
 
 
 def play(filepath: str) -> None:
+    log.info("Play: %s", filepath)
     _rpc("Player.Open", {"item": {"file": filepath}})
 
 
 def is_playing() -> bool:
     data = _rpc("Player.GetActivePlayers") or {}
-    return bool(data.get("result"))
+    playing = bool(data.get("result"))
+    log.debug("is_playing=%s", playing)
+    return playing
 
 
 def progress_notify(filename: str, percent: int, speed: str) -> None:

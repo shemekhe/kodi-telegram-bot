@@ -15,11 +15,17 @@ from telethon.tl.types import (
 
 
 def humanize_size(size_bytes: float) -> str:
+    """Return human readable size (caps at TB to avoid index errors).
+
+    For extremely large inputs > TB we still label as TB.
+    """
     if size_bytes <= 0:
         return "0B"
     names = ("B", "KB", "MB", "GB", "TB")
     i = int(math.log(size_bytes, 1024))
-    p = 1024**i
+    if i >= len(names):  # safeguard for pathological values
+        i = len(names) - 1
+    p = 1024 ** i
     return f"{round(size_bytes / p, 2)} {names[i]}"
 
 
@@ -54,19 +60,20 @@ def has_enough_space(path: str, file_size_bytes: int, min_free_mb: int) -> bool:
 
 
 def cleanup_old_files(directory: str, target_free_mb: int) -> int:
-    """Delete oldest files (by mtime) until free space >= target_free_mb.
+    """Delete oldest files (by mtime) recursively until free space >= target_free_mb.
 
-    Returns number of files deleted. Only deletes regular files inside the top directory.
+    Designed to work with organized media directories (Movies/, Series/, Other/).
+    Only regular files are removed; empty directories are left as‑is. Best effort.
     """
     deleted = 0
     try:
         entries = []
-        for name in os.listdir(directory):
-            full = os.path.join(directory, name)
-            if os.path.isfile(full):
+        for root, _dirs, files in os.walk(directory):
+            for name in files:
+                full = os.path.join(root, name)
                 try:
                     entries.append((os.path.getmtime(full), full, os.path.getsize(full)))
-                except OSError:  # skip unreadable
+                except OSError:
                     pass
         entries.sort()  # oldest first
         for _mtime, full, _size in entries:
@@ -75,11 +82,39 @@ def cleanup_old_files(directory: str, target_free_mb: int) -> int:
             try:
                 os.remove(full)
                 deleted += 1
-            except OSError:
+            except OSError:  # ignore failures
                 pass
     except Exception:  # noqa: BLE001
         return deleted
     return deleted
+
+
+def remove_empty_parents(path: str, stop_dirs: list[str]) -> int:
+    """Remove empty parent directories up to (but excluding) any stop directory.
+
+    Returns number of directories removed. Best effort only.
+    """
+    removed = 0
+    try:
+        stop_set = {os.path.abspath(d) for d in stop_dirs}
+        cur = os.path.abspath(os.path.dirname(path))
+        while cur not in stop_set:
+            if not os.path.isdir(cur):  # nothing more to do
+                break
+            try:
+                if os.listdir(cur):  # not empty
+                    break
+            except OSError:
+                break
+            try:
+                os.rmdir(cur)
+                removed += 1
+            except OSError:
+                break
+            cur = os.path.abspath(os.path.dirname(cur))
+    except Exception:  # noqa: BLE001
+        return removed
+    return removed
 
 
 _last_mem_warn: float = 0.0
@@ -113,4 +148,5 @@ __all__ = [
     "has_enough_space",
     "maybe_memory_warning",
     "cleanup_old_files",
+    "remove_empty_parents",
 ]

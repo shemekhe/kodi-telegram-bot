@@ -64,3 +64,29 @@ def test_cleanup_old_files(tmp_path, monkeypatch):
     deleted = utils.cleanup_old_files(str(tmp_path), 250)
     # Should delete at least two oldest files to reach target
     assert deleted >= 2
+
+
+def test_cleanup_old_files_recursive(tmp_path, monkeypatch):
+    # Create nested media style structure
+    movies = tmp_path / "Movies" / "Film A (2020)"
+    series = tmp_path / "Series" / "Show (2021)" / "Season 1"
+    other = tmp_path / "Other"
+    for d in (movies, series, other):
+        d.mkdir(parents=True)
+    f1 = movies / "Film A (2020).mkv"
+    f2 = series / "Show S01E01.mkv"
+    f3 = other / "Random.bin"
+    f1.write_bytes(b"0" * 10)
+    f2.write_bytes(b"0" * 10)
+    f3.write_bytes(b"0" * 10)
+    import time
+    import os
+    now = time.time()
+    os.utime(f1, (now - 300, now - 300))
+    os.utime(f2, (now - 200, now - 200))
+    os.utime(f3, (now - 100, now - 100))
+
+    frees = [50, 50, 50, 400]
+    monkeypatch.setattr(utils, "free_disk_mb", lambda p: frees.pop(0))
+    deleted = utils.cleanup_old_files(str(tmp_path), 300)
+    assert deleted >= 2

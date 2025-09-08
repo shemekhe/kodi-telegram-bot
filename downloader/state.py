@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Any
 from telethon.tl.custom.message import Message
 
 
@@ -18,6 +18,7 @@ class DownloadState:
     path: str
     size: int  # expected total size in bytes
     message: Optional[Message] = None
+    original_event: Optional[Any] = None  # Store the original event for duplicate detection
     paused: bool = False
     cancelled: bool = False
     last_text: str = ""
