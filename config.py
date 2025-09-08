@@ -10,7 +10,9 @@ import os
 import re
 from dotenv import load_dotenv
 
-load_dotenv()
+# Allow tests to bypass .env to simulate open access scenarios.
+if os.getenv("SKIP_DOTENV", "0") != "1":  # pragma: no cover simple branch
+    load_dotenv()
 
 def _env_int(name: str, default: int) -> int:
     try:

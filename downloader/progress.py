@@ -47,6 +47,15 @@ def create_progress_callback(filename: str, start: float, rate: RateLimiter, msg
         except Exception:  # noqa: BLE001
             pass
 
+    def _build_edit_kwargs():
+        if state and not state.cancelled:
+            try:  # pragma: no cover - defensive
+                from .buttons import build_buttons  # local import to avoid cycle
+                return {"buttons": build_buttons(state)}
+            except Exception:  # noqa: BLE001
+                return {}
+        return {}
+
     async def send_tg_update(percent: int, received: int, total: int, speed: str):
         bar = "▓" * (percent // 10) + "░" * (10 - percent // 10)
         try:
@@ -54,7 +63,8 @@ def create_progress_callback(filename: str, start: float, rate: RateLimiter, msg
                 f"Downloading: {filename}\n"
                 f"Progress: {bar} {percent}%\n"
                 f"Size: {utils.humanize_size(received)}/{utils.humanize_size(total)}\n"
-                f"Speed: {speed}/s"
+                f"Speed: {speed}/s",
+                **_build_edit_kwargs(),
             )
         except Exception:  # noqa: BLE001
             pass

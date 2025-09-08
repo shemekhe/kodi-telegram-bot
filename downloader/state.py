@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional, Any
+from dataclasses import dataclass, field
+from typing import Optional, Any, List
 from telethon.tl.custom.message import Message
 
 
@@ -18,10 +18,12 @@ class DownloadState:
     path: str
     size: int  # expected total size in bytes
     message: Optional[Message] = None
-    original_event: Optional[Any] = None  # Store the original event for duplicate detection
+    original_event: Optional[Any] = None  # Original upload event (reply target for progress)
     paused: bool = False
     cancelled: bool = False
     last_text: str = ""
+    # Additional progress mirror messages (for duplicate requests from other users)
+    extra_messages: List[Message] = field(default_factory=list)
 
     def mark_paused(self):
         if not self.cancelled:

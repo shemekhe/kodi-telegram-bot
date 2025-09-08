@@ -18,19 +18,33 @@ class QueuedItem:
     document: any
     size: int
     path: str
-    event: any
+    event: any  # original enqueue event
     message: any | None = None
     cancelled: bool = False
+    # Events from other users requesting same file while queued; will receive progress when started
+    watcher_events: list[Any] = None
+
+    def add_watcher(self, ev):  # lightweight helper
+        if self.watcher_events is None:
+            self.watcher_events = []
+        self.watcher_events.append(ev)
 
 
 class DownloadQueue:
     """In‑memory async FIFO queue for pending downloads with cancellation support."""
 
     def __init__(self, limit: int):
+        # Basic capacity + synchronization primitives
         self.limit = limit
         self._semaphore = asyncio.Semaphore(limit)
         self._queue: asyncio.Queue[str] = asyncio.Queue()
+        # Visible queued items (filename -> QueuedItem)
         self.items: Dict[str, QueuedItem] = {}
+        # Monotonic counter for assigning stable queue numbers
+        self._counter = 0
+        # Lock protects enqueue section assigning positions
+        self._lock = asyncio.Lock()
+        # Worker bookkeeping
         self._worker_task: asyncio.Task | None = None
         self._runner: RunnerFunc | None = None
         self._stopping = False
@@ -47,15 +61,36 @@ class DownloadQueue:
     def is_saturated(self) -> bool:
         return self._semaphore.locked()
 
-    async def enqueue(self, qi: QueuedItem):
-        self.items[qi.filename] = qi
-        await self._queue.put(qi.filename)
+    async def enqueue(self, qi: QueuedItem) -> int:
+        """Enqueue an item and return its 1‑based position at insertion.
+
+        Uses an internal lock so that when multiple files are queued nearly
+        simultaneously (e.g. user sends many files) each gets a distinct
+        position instead of all observing the same pre‑enqueue size.
+        """
+        async with self._lock:
+            self._counter += 1
+            position = self._counter
+            self.items[qi.filename] = qi
+            await self._queue.put(qi.filename)
+            return position
 
     def cancel(self, filename: str) -> bool:
+        """Cancel a queued (not yet started) item.
+
+        Implementation detail: we remove the item from the ``items`` mapping
+        immediately so status queries stop reporting it. The filename token
+        already sits inside the internal asyncio.Queue; when the worker later
+        dequeues it, ``_process_item`` will find no entry (``None``) and skip.
+        This keeps the implementation simple without needing a costly queue
+        compaction / rebuild.
+        """
         qi = self.items.get(filename)
         if not qi or qi.cancelled:
             return False
         qi.cancelled = True
+        # Remove from visible queue immediately; worker will ignore leftover token
+        self.items.pop(filename, None)
         return True
 
     def ensure_worker(self, loop: asyncio.AbstractEventLoop, client: TelegramClient):

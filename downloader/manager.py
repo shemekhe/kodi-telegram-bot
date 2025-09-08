@@ -92,12 +92,14 @@ async def pre_checks(event: events.NewMessage.Event):
             actual = 0
         if file_size == 0 or actual >= file_size * 0.98:
             await event.respond(
-                f"ℹ️ File already exists: {filename} (size: {utils.humanize_size(actual)})"
+                f"ℹ️ File already exists: {filename} (size: {utils.humanize_size(actual)})",
+                reply_to=getattr(event, 'id', None),
             )
             log.info("Skip existing file %s", filename)
             return None
         await event.respond(
-            f"⚠️ Found incomplete existing file ({utils.humanize_size(actual)}/{utils.humanize_size(file_size)}); re-downloading..."
+            f"⚠️ Found incomplete existing file ({utils.humanize_size(actual)}/{utils.humanize_size(file_size)}); re-downloading...",
+            reply_to=getattr(event, 'id', None),
         )
         try:
             os.remove(path)
@@ -198,9 +200,69 @@ async def run_download(
     filename: str,
     file_size: int,
     path: str,
+    watcher_events: list[Any] | None = None,
+    existing_message: Any | None = None,
 ) -> None:
+    """Run a download and mirror progress to any duplicate requester chats.
+
+    watcher_events: events from other users who requested the same file while queued.
+    """
     state = _init_state(filename, path, file_size, event)
-    msg = await _send_start_message(event, state)
+    if existing_message is not None:
+        # Reuse queued placeholder: transform it into progress message
+        state.message = existing_message
+        try:
+            start_text = f"Starting download of {state.filename}..."
+            await existing_message.edit(start_text, buttons=build_buttons(state))
+            # raw_text on Telethon object may still hold old queued text; store explicitly
+            state.last_text = start_text
+        except Exception:  # noqa: BLE001
+            pass
+        msg = existing_message
+    else:
+        msg = await _send_start_message(event, state)
+
+    # Send initial starting message to watcher events (reply to their file message)
+    if watcher_events:
+        for wev in watcher_events:
+            try:
+                mirror_msg = await wev.respond(
+                    f"Starting download of {state.filename}...",
+                    reply_to=getattr(wev, 'id', None),
+                    buttons=build_buttons(state),
+                )
+                state.extra_messages.append(mirror_msg)
+            except Exception:  # noqa: BLE001
+                pass
+
+    # Monkey patch msg.edit to fan out updates.
+    async def _mirror(text: str):
+        if not state.extra_messages:
+            return
+        for m in state.extra_messages[:]:  # copy to allow mutation on failure
+            try:
+                await m.edit(text)
+            except Exception:  # noqa: BLE001
+                try:
+                    state.extra_messages.remove(m)
+                except ValueError:
+                    pass
+
+    _orig_edit = msg.edit
+
+    async def _patched_edit(text: str, **kwargs):  # pragma: no cover simple wrapper
+        try:
+            r = await _orig_edit(text, **kwargs)
+        except Exception:  # noqa: BLE001
+            r = None
+        await _mirror(text)
+        return r
+
+    try:
+        setattr(msg, 'edit', _patched_edit)
+    except Exception:  # noqa: BLE001
+        pass
+
     progress_cb = create_progress_callback(filename, time.time(), RateLimiter(), msg, state)
 
     try:
@@ -222,11 +284,14 @@ def _init_state(filename: str, path: str, size: int, event: events.NewMessage.Ev
 
 
 async def _send_start_message(event: events.NewMessage.Event, state: DownloadState):
+    start_text = f"Starting download of {state.filename}..."
     msg = await event.respond(
-        f"Starting download of {state.filename}...", buttons=build_buttons(state)
+        start_text,
+        buttons=build_buttons(state),
+        reply_to=getattr(event, 'id', None),
     )
     state.message = msg
-    state.last_text = msg.raw_text
+    state.last_text = start_text
     kodi.notify("Download Started", state.filename)
     log.info("Start download %s (%s)", state.filename, utils.humanize_size(state.size))
     return msg
@@ -306,7 +371,14 @@ def register_handlers(client: TelegramClient):
     if not _queue_started:
         queue.set_runner(
             lambda c, qi: run_download(
-                c, qi.event, qi.document, qi.filename, qi.size, qi.path
+                c,
+                qi.event,
+                qi.document,
+                qi.filename,
+                qi.size,
+                qi.path,
+                watcher_events=qi.watcher_events or [],
+                existing_message=qi.message,
             )
         )
         queue.ensure_worker(client.loop, client)
@@ -324,7 +396,7 @@ def _same_user(ev1, ev2):
     return getattr(ev1, "sender_id", None) == getattr(ev2, "sender_id", None)
 
 
-async def _handle_active_duplicate(event, active_state, filename):
+async def _handle_active_duplicate(event, active_state: DownloadState, filename: str):
     if active_state.paused and not active_state.cancelled:
         active_state.mark_resumed()
         await _safe_edit(
@@ -336,40 +408,47 @@ async def _handle_active_duplicate(event, active_state, filename):
         reply_to_id = active_state.message.id if active_state.message else None
         await event.respond(f"⏳ Already in progress: {filename}", reply_to=reply_to_id)
     else:
-        original_msg_id = (
-            active_state.original_event.id if active_state.original_event else None
-        )
-        await event.respond(
-            f"⏳ {filename} is being downloaded by another user. You'll get progress updates here.",
-            reply_to=original_msg_id,
-        )
+        try:
+            mirror_msg = await event.respond(
+                f"⏳ Already being downloaded: {filename}. You'll receive progress here.",
+                reply_to=getattr(event, 'id', None),
+            )
+            active_state.extra_messages.append(mirror_msg)
+        except Exception:  # noqa: BLE001
+            pass
 
 
-async def _handle_queued_duplicate(event, queued_item, filename):
+async def _handle_queued_duplicate(event, queued_item: QueuedItem, filename: str):
     if queued_item.event and _same_user(event, queued_item.event):
-        await event.respond(f"🕒 Already queued: {filename}", reply_to=queued_item.event.id)
+        await event.respond(f"🕒 Already queued: {filename}", reply_to=getattr(event, 'id', None))
     else:
-        original_msg_id = queued_item.event.id if queued_item.event else None
-        await event.respond(
-            f"🕒 {filename} is queued by another user. You'll get progress updates here.",
-            reply_to=original_msg_id,
-        )
+        try:
+            await event.respond(
+                f"🕒 {filename} is queued. You'll receive progress here when it starts.",
+                reply_to=getattr(event, 'id', None),
+            )
+            queued_item.add_watcher(event)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 async def _enqueue_or_run(client: TelegramClient, document, filename, size, path, event):
     if queue.is_saturated():
-        position = queue._queue.qsize() + 1  # type: ignore[attr-defined]
         qi = QueuedItem(filename, document, size, path, event)
         file_id = _register_file_id(filename)
-        msg = await event.respond(
-            (
-                f"🕒 Queued #{position}: {filename}\n"
-                f"Waiting for free slot (limit {config.MAX_CONCURRENT_DOWNLOADS})"
-            ),
-            buttons=[[Button.inline("🛑 Cancel", data=f"qcancel:{file_id}")]],
-        )
-        qi.message = msg
-        await queue.enqueue(qi)
+        position = await queue.enqueue(qi)
+        try:
+            msg = await event.respond(
+                (
+                    f"🕒 Queued #{position}: {filename}\n"
+                    f"Waiting for free slot (limit {config.MAX_CONCURRENT_DOWNLOADS})"
+                ),
+                buttons=[[Button.inline("🛑 Cancel", data=f"qcancel:{file_id}")]],
+                reply_to=getattr(event, 'id', None),
+            )
+            qi.message = msg
+        except Exception:  # noqa: BLE001
+            pass
         return
     async with queue.slot():  # pragma: no cover - thin wrapper
         if not await _ensure_disk_space(event, filename, size):
@@ -394,25 +473,33 @@ def _register_download_handler(client: TelegramClient):
         if not utils.is_media_file(document):
             await event.respond("⚠️ Only video and audio files are supported")
             return
-        filename = filename_for_document(document)
-        parsed = parse_filename(filename)
-        active_state = states.get(filename)
-        if active_state:
-            await _handle_active_duplicate(event, active_state, filename)
-            return
-        queued_item = queue.items.get(filename)
-        if queued_item:
-            await _handle_queued_duplicate(event, queued_item, filename)
-            return
+        original_filename = filename_for_document(document)
+        parsed = parse_filename(original_filename)
         ambiguous = parsed.category == "other" and parsed.year is not None
+        # For non‑ambiguous cases we can derive the final organized filename now, so
+        # duplicate detection aligns with the active state's normalized name.
+        if not ambiguous or not config.ORGANIZE_MEDIA:
+            _path_tmp, normalized_name = build_final_path(original_filename)
+            lookup_name = normalized_name
+        else:
+            lookup_name = original_filename
+
+        active_state = states.get(lookup_name)
+        if active_state:
+            await _handle_active_duplicate(event, active_state, lookup_name)
+            return
+        queued_item = queue.items.get(lookup_name)
+        if queued_item:
+            await _handle_queued_duplicate(event, queued_item, lookup_name)
+            return
         if ambiguous and config.ORGANIZE_MEDIA:
-            file_id = _register_file_id(filename)
+            file_id = _register_file_id(original_filename)
             buttons = [[
                 Button.inline("🎬 Movie", data=f"catm:{file_id}"),
                 Button.inline("📺 Series", data=f"cats:{file_id}"),
                 Button.inline("📁 Other", data=f"cato:{file_id}"),
             ]]
-            await event.respond(f"Select category for: {filename}", buttons=buttons)
+            await event.respond(f"Select category for: {original_filename}", buttons=buttons)
             return
         pre = await pre_checks(event)
         if not pre:
@@ -494,6 +581,27 @@ def _register_control_callbacks(client: TelegramClient):
 def _register_pause_resume_cancel(client: TelegramClient):
     pattern = b"(pause|resume|cancel):"
 
+    async def _do_pause(st, event):
+        if st.paused:
+            await event.answer("Already paused", alert=False)
+            return
+        st.mark_paused()
+        await _safe_edit(st.message, st.last_text or st.message.raw_text, buttons=build_buttons(st))
+        await event.answer("Paused")
+
+    async def _do_resume(st, event):
+        if not st.paused:
+            await event.answer("Not paused", alert=False)
+            return
+        st.mark_resumed()
+        await _safe_edit(st.message, f"▶ Resuming: {st.filename}", buttons=build_buttons(st))
+        await event.answer("Resuming")
+
+    async def _do_cancel(st, event):
+        st.mark_cancelled()
+        await _safe_edit(st.message, f"🛑 Cancelling: {st.filename}")
+        await event.answer("Cancelling")
+
     @client.on(events.CallbackQuery(pattern=pattern))
     async def _prc(event):  # noqa: D401
         action, file_id = event.data.decode().split(":", 1)
@@ -506,23 +614,11 @@ def _register_pause_resume_cancel(client: TelegramClient):
             await event.answer("Not available", alert=False)
             return
         if action == "pause":
-            if st.paused:
-                await event.answer("Already paused", alert=False)
-                return
-            st.mark_paused()
-            await _safe_edit(st.message, st.message.raw_text, buttons=build_buttons(st))
-            await event.answer("Paused")
+            await _do_pause(st, event)
         elif action == "resume":
-            if not st.paused:
-                await event.answer("Not paused", alert=False)
-                return
-            st.mark_resumed()
-            await _safe_edit(st.message, f"▶ Resuming: {st.filename}", buttons=build_buttons(st))
-            await event.answer("Resuming")
+            await _do_resume(st, event)
         else:  # cancel
-            st.mark_cancelled()
-            await _safe_edit(st.message, f"🛑 Cancelling: {st.filename}")
-            await event.answer("Cancelling")
+            await _do_cancel(st, event)
 
 
 def _register_qcancel(client: TelegramClient):
@@ -538,9 +634,12 @@ def _register_qcancel(client: TelegramClient):
             await event.answer("Not found", alert=False)
             return
         queue.cancel(filename)
+        # Update UI: new text + remove buttons. Use safe edit to swallow Telegram race errors.
+        if qi.message:
+            await _safe_edit(qi.message, f"🛑 Cancelled (queued): {filename}", buttons=None)
+        # Remove file id mapping so further clicks show not found
         try:
-            if qi.message:
-                await qi.message.edit(f"🛑 Cancelled (queued): {filename}")
+            file_id_map.pop(file_id, None)
         except Exception:  # noqa: BLE001
             pass
         await event.answer("Cancelled")

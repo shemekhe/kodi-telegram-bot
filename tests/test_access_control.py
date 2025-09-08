@@ -4,6 +4,7 @@ import config
 
 
 def reload_env(monkeypatch, value: str | None):
+    monkeypatch.setenv("SKIP_DOTENV", "1")  # ensure .env values ignored during test reloads
     if value is None:
         monkeypatch.delenv("ALLOWED_USERS", raising=False)
     else:
