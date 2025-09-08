@@ -84,29 +84,75 @@ Send the bot a video or audio file in a private chat. Use `/status` anytime.
 
 Create a Telegram app (API ID / HASH) at https://my.telegram.org and a bot token via @BotFather.
 
-Minimal required:
+### 5.1 Required
+Set all three or the process exits on start:
 ```
 TELEGRAM_API_ID=123456
 TELEGRAM_API_HASH=your_hash
 TELEGRAM_BOT_TOKEN=12345:bot_token
 ```
 
-Common config (see `.env.example`):
+### 5.2 Core (Kodi & Paths)
 ```
-KODI_URL=http://localhost:8080/jsonrpc
-KODI_USERNAME=kodi
-KODI_PASSWORD=your_pass
-DOWNLOAD_DIR=~/Downloads
-MAX_RETRY_ATTEMPTS=3
-MAX_CONCURRENT_DOWNLOADS=5
-MIN_FREE_DISK_MB=200      # hard stop if projected below
-DISK_WARNING_MB=500       # soft warning only
-MEMORY_WARNING_PERCENT=90 # Kodi popup if exceeded (0 disables)
-ORGANIZE_MEDIA=1          # enable structured Movies/Series/Other layout (default 1)
+KODI_URL=http://localhost:8080/jsonrpc   # Adjust if Kodi uses different host/port
+KODI_USERNAME=kodi                       # Must match Kodi settings
+KODI_PASSWORD=your_pass                  # Blank allowed if Kodi has no auth
+DOWNLOAD_DIR=~/Downloads                 # Created if missing
+ORGANIZE_MEDIA=1                         # 1(default)=Movies/Series/Other tree; 0=flat
 ```
-`MEMORY_WARNING_PERCENT=0` disables memory popups.
+`ORGANIZE_MEDIA=0` stores files directly under `DOWNLOAD_DIR` using (sanitized) original filename.
 
-`ORGANIZE_MEDIA=0` stores files flat directly inside `DOWNLOAD_DIR` (no subfolders, original Telegram filename).
+### 5.3 Behavior & Performance
+```
+MAX_RETRY_ATTEMPTS=3        # Network-ish transient failures per item
+MAX_CONCURRENT_DOWNLOADS=5  # Active simultaneous downloads
+```
+
+### 5.4 Safety Thresholds
+```
+MIN_FREE_DISK_MB=200        # Hard gate: refuse (or auto-clean; then refuse if still low)
+DISK_WARNING_MB=500         # Soft warning only
+MEMORY_WARNING_PERCENT=90   # Show Kodi popup if exceeded; 0 disables
+```
+Disk auto-clean deletes oldest files recursively inside the media root until the projected free space after the pending download is >= `MIN_FREE_DISK_MB` or nothing left to delete.
+
+### 5.5 Access Control (Optional)
+```
+ALLOWED_USERS=12345678,@alice,bob
+```
+Comma OR space separated. Accepts numeric IDs and/or usernames (with or without `@`). Empty/unset = open to everyone (still private chats only). Usernames are case‑insensitive; prefer numeric IDs for permanence.
+
+### 5.6 Logging (Optional Overrides)
+```
+LOG_FILE=bot.log            # Path; single file truncated in-place
+LOG_LEVEL=INFO              # DEBUG / INFO / WARNING / ERROR
+LOG_MAX_MB=200              # Hard cap; file truncates before exceeding
+```
+Set none to accept defaults. Truncation writes a header line noting previous size & UTC timestamp.
+
+### 5.7 Quick Reference Table
+
+| Name | Default | Notes |
+|------|---------|-------|
+| TELEGRAM_API_ID | (required) | Numeric app ID from my.telegram.org |
+| TELEGRAM_API_HASH | (required) | App hash from my.telegram.org |
+| TELEGRAM_BOT_TOKEN | (required) | Token from @BotFather |
+| KODI_URL | http://localhost:8080/jsonrpc | Kodi JSON-RPC endpoint |
+| KODI_USERNAME | kodi | Kodi HTTP username |
+| KODI_PASSWORD | (blank) | Kodi HTTP password (blank allowed) |
+| DOWNLOAD_DIR | ~/Downloads | Storage root (created if missing) |
+| ORGANIZE_MEDIA | 1 | 1 enable Movies/Series/Other; 0 flat layout |
+| MAX_RETRY_ATTEMPTS | 3 | Per download retry count (transient errors) |
+| MAX_CONCURRENT_DOWNLOADS | 5 | Parallel download slots |
+| MIN_FREE_DISK_MB | 200 | Hard free-space floor (after projected size) |
+| DISK_WARNING_MB | 500 | Soft warning threshold |
+| MEMORY_WARNING_PERCENT | 90 | 0 disables memory popup; otherwise warn >= value |
+| ALLOWED_USERS | (blank) | Comma/space IDs & usernames; blank=open |
+| LOG_FILE | bot.log | Truncating log file path |
+| LOG_LEVEL | INFO | Logging verbosity |
+| LOG_MAX_MB | 200 | Max size before in-place truncate |
+
+Tip: copy `.env.example` to `.env` then edit; unused commented lines can stay.
 
 ## Creating Your Telegram Bot (Detail)
 

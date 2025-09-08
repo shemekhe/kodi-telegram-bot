@@ -21,36 +21,37 @@ def startup_message() -> None:
 
 
 def main() -> None:
-    client = _setup_client()
-    loop = client.loop
-    shutdown_event = asyncio.Event()
+    asyncio.run(_main())
+
+
+async def _main():
+    client, shutdown_event = await _setup_client()
+    loop = asyncio.get_running_loop()
 
     async def shutdown():
         await _graceful_shutdown(client, shutdown_event)
 
     _install_signal_handlers(loop, shutdown)
     try:
-        client.run_until_disconnected()
+        await client.run_until_disconnected()
     finally:
         if not shutdown_event.is_set():
-            loop.run_until_complete(shutdown())
+            await shutdown()
 
 
-def _setup_client():
+async def _setup_client():
     config.validate()
-    client = TelegramClient("bot", config.API_ID, config.API_HASH)
-    client.start(bot_token=config.BOT_TOKEN)
+    client = TelegramClient("bot", config.API_ID, config.API_HASH, catch_up=True)
     register_handlers(client)
-    # Schedule catch_up so it runs after loop is running
-    async def _do_catch_up():
-        try:
-            await client.catch_up()
-        except Exception as e:  # noqa: BLE001
-            log.warning("catch_up failed: %s", e)
-    client.loop.create_task(_do_catch_up())
+    await client.start(bot_token=config.BOT_TOKEN)
+    try:  # Explicit catch-up so we know backlog is processed before announcing ready.
+        await client.catch_up()
+        log.debug("Initial catch_up completed")
+    except Exception as e:  # noqa: BLE001
+        log.warning("catch_up error: %s", e)
     startup_message()
     log.info("Bridge running – send a video or audio file to this bot in a private chat.")
-    return client
+    return client, asyncio.Event()
 
 
 async def _graceful_shutdown(client, shutdown_event: asyncio.Event):
@@ -79,30 +80,28 @@ async def _graceful_shutdown(client, shutdown_event: asyncio.Event):
 
 
 def _cleanup_partials(active_snapshot):
-    """Delete incomplete files for cancelled active or queued items.
+    """Delete incomplete files for cancelled active or queued items (best‑effort)."""
 
-    Returns number of files removed. Best‑effort only; all errors suppressed.
-    """
-    removed = 0
-    # Active
-    for st in active_snapshot:
+    def _maybe_remove(path: str, expected: int) -> int:
         try:
-            if os.path.exists(st.path) and not validate_size(st.size, st.path):
-                os.remove(st.path)
-                remove_empty_parents(st.path, [config.DOWNLOAD_DIR])
-                removed += 1
+            if os.path.exists(path) and not validate_size(expected, path):
+                os.remove(path)
+                remove_empty_parents(path, [config.DOWNLOAD_DIR])
+                return 1
         except Exception:  # noqa: BLE001
-            pass
-    # Queued
+            return 0
+        return 0
+
+    removed = 0
+    for st in active_snapshot:
+        removed += _maybe_remove(st.path, st.size)
     try:
         for qi in queue.items.values():  # type: ignore[attr-defined]
             try:
                 if os.path.exists(qi.path):
                     sz = os.path.getsize(qi.path)
                     if qi.size == 0 or sz < qi.size * 0.98:
-                        os.remove(qi.path)
-                        remove_empty_parents(qi.path, [config.DOWNLOAD_DIR])
-                        removed += 1
+                        removed += _maybe_remove(qi.path, qi.size or sz)
             except Exception:  # noqa: BLE001
                 pass
     except Exception:  # noqa: BLE001

@@ -1,10 +1,10 @@
 # Core dependencies
-telethon>=1.40.0
-requests>=2.32.3
+telethon>=1.40.1
+requests>=2.32.5
 psutil>=7.0.0
-python-dotenv>=1.1.0  # For loading .env files
+python-dotenv>=1.1.1  # For loading .env files
 
-# Optional dependencies
+# Optional dependencies for telethon - See: https://docs.telethon.dev/en/stable/basic/installation.html#optional-dependencies
 cryptg>=0.5.0  # For faster downloads
 pillow>=11.2.1  # For image processing
 aiohttp>=3.11.18  # For async HTTP requests

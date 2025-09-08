@@ -25,6 +25,8 @@ file_id_map: dict[str, str] = {}
 # _queue_started gates one‑time registration of queue worker & handlers
 _queue_started = False
 
+_NOT_FOUND = "File not found"
+
 
 def _register_file_id(filename: str) -> str:
     """Register filename and return its short ID."""
@@ -378,6 +380,16 @@ async def _enqueue_or_run(client: TelegramClient, document, filename, size, path
 def _register_download_handler(client: TelegramClient):
     @client.on(events.NewMessage(func=lambda e: e.is_private and e.document))
     async def _download(event):  # noqa: D401
+        # Access control
+        sender = await event.get_sender()
+        uid = getattr(sender, 'id', None)
+        uname = getattr(sender, 'username', None)
+        if not config.is_user_allowed(uid, uname):
+            try:
+                await event.respond("🛑 You are not authorized to use this bot.")
+            except Exception:  # noqa: BLE001
+                pass
+            return
         document = event.document
         if not utils.is_media_file(document):
             await event.respond("⚠️ Only video and audio files are supported")
@@ -392,21 +404,15 @@ def _register_download_handler(client: TelegramClient):
         if queued_item:
             await _handle_queued_duplicate(event, queued_item, filename)
             return
-        # Ambiguous: heuristics said 'other' but file looks like potential movie (has year token)
         ambiguous = parsed.category == "other" and parsed.year is not None
         if ambiguous and config.ORGANIZE_MEDIA:
-            # Ask user for category selection before proceeding
             file_id = _register_file_id(filename)
-            buttons = [
-                [
-                    Button.inline("🎬 Movie", data=f"catm:{file_id}"),
-                    Button.inline("📺 Series", data=f"cats:{file_id}"),
-                    Button.inline("📁 Other", data=f"cato:{file_id}"),
-                ]
-            ]
-            await event.respond(
-                f"Select category for: {filename}", buttons=buttons
-            )
+            buttons = [[
+                Button.inline("🎬 Movie", data=f"catm:{file_id}"),
+                Button.inline("📺 Series", data=f"cats:{file_id}"),
+                Button.inline("📁 Other", data=f"cato:{file_id}"),
+            ]]
+            await event.respond(f"Select category for: {filename}", buttons=buttons)
             return
         pre = await pre_checks(event)
         if not pre:
@@ -425,6 +431,10 @@ def _register_status_handler(client: TelegramClient):
         )
     )
     async def _status(event):  # noqa: D401
+        sender = await event.get_sender()
+        if not config.is_user_allowed(getattr(sender, 'id', None), getattr(sender, 'username', None)):
+            await event.respond("🛑 Not authorized.")
+            return
         q = list(queue.items.keys())
         active = list(states.keys())
         parts = [
@@ -454,6 +464,10 @@ def _register_start_handler(client: TelegramClient):
         )
     )
     async def _start(event):  # noqa: D401
+        sender = await event.get_sender()
+        if not config.is_user_allowed(getattr(sender, 'id', None), getattr(sender, 'username', None)):
+            await event.respond("🛑 Not authorized.")
+            return
         await event.respond(HELP_TEXT)
 
 
@@ -487,7 +501,7 @@ def _register_pause_resume_cancel(client: TelegramClient):
         action, file_id = event.data.decode().split(":", 1)
         filename = _resolve_file_id(file_id)
         if not filename:
-            await event.answer("File not found", alert=False)
+            await event.answer(_NOT_FOUND, alert=False)
             return
         st = states.get(filename)
         if not st or st.cancelled:
@@ -519,7 +533,7 @@ def _register_qcancel(client: TelegramClient):
         file_id = event.data.decode().split(":", 1)[1]
         filename = _resolve_file_id(file_id)
         if not filename:
-            await event.answer("File not found", alert=False)
+            await event.answer(_NOT_FOUND, alert=False)
             return
         qi = queue.items.get(filename)
         if not (qi and not qi.cancelled):
@@ -541,7 +555,7 @@ def _register_category_selection(client: TelegramClient):
         prefix, file_id = data.split(":", 1)
         filename = _resolve_file_id(file_id)
         if not filename:
-            await event.answer("File not found", alert=False)
+            await event.answer(_NOT_FOUND, alert=False)
             return
         forced = {"catm": "movie", "cats": "series", "cato": "other"}.get(prefix)
         if not forced:
