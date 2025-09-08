@@ -453,9 +453,7 @@ def _register_status_handler(client: TelegramClient):
 def _register_start_handler(client: TelegramClient):
     HELP_TEXT = (
         "Send me a video or audio file — I'll download it and play it on Kodi.\n\n"
-        "Commands:\n/status – show active + queued downloads\n/start – this help\n\n"
-        "Use buttons to Pause / Resume / Cancel during a download.\n"
-        "Skips if disk would drop below MIN_FREE_DISK_MB (auto-clean may free space)."
+        "Commands:\n/status – show active + queued downloads\n/start - this help"
     )
 
     @client.on(
