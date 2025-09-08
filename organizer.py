@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 import re
-from typing import Iterable, List, Tuple
+from typing import Iterable, List, Tuple, Optional
 
 import config
 
@@ -152,27 +152,58 @@ def _extract_edition(tokens: List[str]) -> tuple[str | None, List[str]]:
     return edition, remaining
 
 
-def parse_filename(filename: str) -> ParsedMedia:
-    stem, _ext = os.path.splitext(filename)
-    # Handle trailing duplicate suffix like _1
-    stem = re.sub(r"_(\d+)$", "", stem)
-    tokens = _tokenize(stem)
-    if not tokens:
-        return ParsedMedia("unknown", filename)
+_MOVIE_LINE_RE = re.compile(r"^🎬\s+(.+?)\s*\((\d{4})\)\s*$")
+_SERIES_HEADER_RE = re.compile(r"^🎬\s+سریال\s+(.+?)\s+محصول سال\s+(\d{4})\s*$")
+_SERIES_EP_RE = re.compile(r"^📁\s+فصل\s+(\d{1,2})\s+قسمت\s+(\d{1,3})\s*$")
 
+
+def _parse_caption(text: str | None) -> Optional[ParsedMedia]:
+    """Best‑effort extraction from known caption templates.
+
+    Only returns a ParsedMedia when patterns *strictly* match the provided
+    (movie / series) examples to avoid false positives. Otherwise returns None
+    so caller can fall back to filename parsing.
+    """
+    if not text:
+        return None
+    # Normalize newlines + trim whitespace lines
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return None
+    # Movie pattern: requires first line 🎬 Title (Year) and at least one more line starting with 🖥
+    m = _MOVIE_LINE_RE.match(lines[0])
+    if m and any(ln.startswith('🖥') for ln in lines[1:3]):  # keep it tight (next couple of lines)
+        title = m.group(1).strip()
+        year = int(m.group(2))
+        norm_stem = f"{title} ({year})"
+        return ParsedMedia("movie", title, year, None, None, norm_stem, None)
+    # Series pattern requires header + episode line
+    sh = _SERIES_HEADER_RE.match(lines[0])
+    if sh:
+        title = sh.group(1).strip()
+        year = int(sh.group(2))
+        # find episode line (usually second non‑empty)
+        ep_line = next((ln for ln in lines[1:4] if ln.startswith('📁')), None)
+        if ep_line:
+            epm = _SERIES_EP_RE.match(ep_line)
+            if epm:
+                season = int(epm.group(1))
+                episode = int(epm.group(2))
+                norm_stem = f"{title} S{season:02d}E{episode:02d}"
+                return ParsedMedia("series", title, year, season, episode, norm_stem, None)
+    return None
+
+
+def _parse_from_tokens(tokens: List[str]) -> ParsedMedia:
+    """Filename token heuristic parsing (legacy path)."""
     year, year_index = _detect_year(tokens)
     season, episode, series_index = _detect_series(tokens)
-
     edition, base_tokens = _extract_edition(tokens)
-
-    # Replace tokens list with edition-stripped version for title building logic
     tokens = base_tokens
-    # Adjust indexes if edition tokens removed before indexes (simpler: recompute)
     if season is not None or episode is not None:
         season, episode, series_index = _detect_series(tokens)
     if year is not None:
         year, year_index = _detect_year(tokens)
-
     if series_index != -1 and season is not None and episode is not None:
         show_tokens = tokens[:series_index]
         show_year = None
@@ -183,26 +214,36 @@ def parse_filename(filename: str) -> ParsedMedia:
         title = _build_title(cleaned or show_tokens)
         norm_stem = f"{title} S{season:02d}E{episode:02d}"
         return ParsedMedia("series", title, show_year, season, episode, norm_stem, edition)
-
     if year is not None and year_index > 0:
         title_tokens = tokens[:year_index]
         cleaned = _clean_tokens(title_tokens)
         base_title = _build_title(cleaned or title_tokens)
-        # Append edition if present
         title = base_title
         norm_title = base_title
         if edition:
             title = f"{base_title} {edition}"
-            norm_title = base_title  # Do not put edition inside folder parentheses stem
+            norm_title = base_title
         norm_stem = f"{norm_title} ({year})"
         return ParsedMedia("movie", title, year, None, None, norm_stem, edition)
-
     cleaned_all = _clean_tokens(tokens)
     title = _build_title(cleaned_all or tokens)
     return ParsedMedia("other", title, None, None, None, None, edition)
 
 
-def build_final_path(filename: str, base_dir: str | None = None, forced_category: str | None = None) -> Tuple[str, str]:
+def parse_filename(filename: str, text: str | None = None) -> ParsedMedia:
+    # Caption path
+    parsed_caption = _parse_caption(text)
+    if parsed_caption:
+        return parsed_caption
+    stem, _ext = os.path.splitext(filename)
+    stem = re.sub(r"_(\d+)$", "", stem)
+    tokens = _tokenize(stem)
+    if not tokens:
+        return ParsedMedia("unknown", filename)
+    return _parse_from_tokens(tokens)
+
+
+def build_final_path(filename: str, base_dir: str | None = None, forced_category: str | None = None, text: str | None = None) -> Tuple[str, str]:
     """Return (final_path, final_filename).
 
     If organization disabled returns original path/filename.
@@ -211,7 +252,7 @@ def build_final_path(filename: str, base_dir: str | None = None, forced_category
     if not config.ORGANIZE_MEDIA:
         return os.path.join(base_dir, filename), filename
 
-    parsed = parse_filename(filename)
+    parsed = parse_filename(filename, text=text)
     if forced_category:
         # Allow manual override when heuristics failed.
         if forced_category in {"movie", "series", "other"}:

@@ -41,6 +41,40 @@ def test_parse_series_weird_season_token():
     assert p.normalized_stem.startswith("The Mentalist S04E24")
 
 
+def test_parse_from_caption_movie():
+    caption = """🎬 Ballerina (2025)\n🖥 BluRay 1080p YTS\n\n🤖 | @alphadlbot"""
+    p = parse_filename("Some.Random.File.mkv", text=caption)
+    assert p.category == "movie" and p.title == "Ballerina" and p.year == 2025
+    assert p.normalized_stem == "Ballerina (2025)"
+
+
+def test_parse_from_caption_series():
+    caption = (
+        "🎬 سریال Rick and Morty محصول سال 2013\n\n"
+        "📁 فصل 01 قسمت 05\n"
+        "📥 کیفیت: BluRay 1080p Farsi Dubbed"
+    )
+    p = parse_filename("Rick.and.Morty.random.mkv", text=caption)
+    assert p.category == "series" and p.title == "Rick and Morty" and p.season == 1 and p.episode == 5
+    assert p.year == 2013
+
+
+def test_build_path_from_caption_series(monkeypatch):
+    import tempfile
+    import config as cfg
+    caption = (
+        "🎬 سریال Rick and Morty محصول سال 2013\n\n"
+        "📁 فصل 01 قسمت 05\n"
+        "📥 کیفیت: BluRay 1080p Farsi Dubbed"
+    )
+    with tempfile.TemporaryDirectory() as td:
+        monkeypatch.setattr(cfg, "DOWNLOAD_DIR", td)
+        monkeypatch.setattr(cfg, "ORGANIZE_MEDIA", True)
+        path, fname = build_final_path("Rick.And.Morty.S01E05.mkv", base_dir=td, text=caption)
+        assert "(2013)" in path  # year folder used
+        assert fname.startswith("Rick and Morty S01E05")
+
+
 def test_build_final_path_movie(monkeypatch):
     with tempfile.TemporaryDirectory() as td:
         monkeypatch.setattr(config, "DOWNLOAD_DIR", td)

@@ -63,7 +63,7 @@ def validate_size(expected_size: int, path: str) -> bool:
     return os.path.exists(path) and os.path.getsize(path) >= expected_size * 0.98
 
 
-async def pre_checks(event: events.NewMessage.Event):
+async def pre_checks(event: events.NewMessage.Event, text: str | None = None):
     document = event.document
     if not utils.is_media_file(document):
         await event.respond("⚠️ Only video and audio files are supported")
@@ -73,7 +73,7 @@ async def pre_checks(event: events.NewMessage.Event):
     file_size = document.size or 0
     # Determine organized final path (may create subdirs). We only reserve space based on
     # final path so duplicates are detected on normalized name.
-    path, final_name = build_final_path(filename)
+    path, final_name = build_final_path(filename, text=text)
     filename = final_name  # downstream uses normalized form
     if not await _ensure_disk_space(event, filename, file_size):
         return None
@@ -474,12 +474,13 @@ def _register_download_handler(client: TelegramClient):
             await event.respond("⚠️ Only video and audio files are supported")
             return
         original_filename = filename_for_document(document)
-        parsed = parse_filename(original_filename)
+        # Provide message text (caption) to parser for richer extraction
+        parsed = parse_filename(original_filename, text=(event.raw_text or None))
         ambiguous = parsed.category == "other" and parsed.year is not None
-        # For non‑ambiguous cases we can derive the final organized filename now, so
-        # duplicate detection aligns with the active state's normalized name.
+        # For non‑ambiguous cases we can derive the final organized filename now,
+        # so duplicate detection aligns with the active state's normalized name.
         if not ambiguous or not config.ORGANIZE_MEDIA:
-            _path_tmp, normalized_name = build_final_path(original_filename)
+            _path_tmp, normalized_name = build_final_path(original_filename, text=(event.raw_text or None))
             lookup_name = normalized_name
         else:
             lookup_name = original_filename
@@ -501,7 +502,7 @@ def _register_download_handler(client: TelegramClient):
             ]]
             await event.respond(f"Select category for: {original_filename}", buttons=buttons)
             return
-        pre = await pre_checks(event)
+        pre = await pre_checks(event, text=(event.raw_text or None))
         if not pre:
             return
         document, filename, size, path = pre
