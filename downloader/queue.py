@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Dict, Protocol, Any
+from typing import Dict, Protocol, Any, List
 from telethon import TelegramClient
 import config
 
@@ -22,7 +22,9 @@ class QueuedItem:
     message: any | None = None
     cancelled: bool = False
     # Events from other users requesting same file while queued; will receive progress when started
-    watcher_events: list[Any] = None
+    watcher_events: list[Any] | None = None
+    # Short file id used for callback data (cancel button). Stored so we can rebuild buttons when renumbering.
+    file_id: str | None = None
 
     def add_watcher(self, ev):  # lightweight helper
         if self.watcher_events is None:
@@ -40,12 +42,11 @@ class DownloadQueue:
         self._queue: asyncio.Queue[str] = asyncio.Queue()
         # Visible queued items (filename -> QueuedItem)
         self.items: Dict[str, QueuedItem] = {}
-        # Monotonic counter for assigning stable queue numbers
-        self._counter = 0
-        # Lock protects enqueue section assigning positions
+        # Lock protects enqueue + renumber
         self._lock = asyncio.Lock()
         # Worker bookkeeping
         self._worker_task: asyncio.Task | None = None
+        self._active_tasks: List[asyncio.Task] = []
         self._runner: RunnerFunc | None = None
         self._stopping = False
 
@@ -64,13 +65,12 @@ class DownloadQueue:
     async def enqueue(self, qi: QueuedItem) -> int:
         """Enqueue an item and return its 1‑based position at insertion.
 
-        Uses an internal lock so that when multiple files are queued nearly
-        simultaneously (e.g. user sends many files) each gets a distinct
-        position instead of all observing the same pre‑enqueue size.
+        Positions are dynamic: when earlier items start or are cancelled the
+        remaining queued messages are renumbered. We still need a lock to avoid
+        race conditions when several enqueues happen at once.
         """
         async with self._lock:
-            self._counter += 1
-            position = self._counter
+            position = len(self.items) + 1
             self.items[qi.filename] = qi
             await self._queue.put(qi.filename)
             return position
@@ -91,6 +91,12 @@ class DownloadQueue:
         qi.cancelled = True
         # Remove from visible queue immediately; worker will ignore leftover token
         self.items.pop(filename, None)
+        # Schedule renumber of remaining items (fire-and-forget)
+        try:  # pragma: no cover - best effort
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._renumber())
+        except Exception:
+            pass
         return True
 
     def ensure_worker(self, loop: asyncio.AbstractEventLoop, client: TelegramClient):
@@ -111,26 +117,44 @@ class DownloadQueue:
         return self._semaphore
 
     async def _worker(self, client: TelegramClient):  # pragma: no cover
+        # Spawn a task per queued item so multiple queued downloads can run
+        # concurrently up to the semaphore limit. Previously we awaited each
+        # item sequentially which effectively forced single concurrency for
+        # queued items.
         while True:
             fname = await self._queue.get()
-            try:
-                if fname == "__STOP__":
-                    break
-                await self._process_item(client, fname)
-            finally:
+            if fname == "__STOP__":
                 self._queue.task_done()
+                break
+            # Start processing task (will itself acquire semaphore)
+            t = asyncio.create_task(self._process_item(client, fname))
+            self._active_tasks.append(t)
+            # Remove finished tasks
+            t.add_done_callback(lambda _t: self._active_tasks.remove(_t) if _t in self._active_tasks else None)
+            self._queue.task_done()
+        # Wait for active tasks to finish (graceful shutdown)
+        if self._active_tasks:
+            await asyncio.gather(*self._active_tasks, return_exceptions=True)
         if self._stopping:
             await self._cleanup_remaining()
 
     async def _process_item(self, client: TelegramClient, fname: str):
-        qi = self.items.pop(fname, None)
+        # Keep item in self.items while waiting for semaphore so it appears in /status and can be cancelled.
+        qi = self.items.get(fname)
         if not qi or qi.cancelled:
             return
         async with self._semaphore:
+            # Pop only after acquiring slot (start time) so other queued positions remain stable.
+            qi = self.items.pop(fname, None)
+            if not qi or qi.cancelled:
+                # If cancelled while waiting, just renumber remaining.
+                await self._renumber()
+                return
+            # Renumber remaining queued messages since this one is starting now.
+            await self._renumber()
             try:
                 if self._runner:
-                    # Late disk-space revalidation for queued downloads.
-                    from . import manager  # local import to avoid cycle at module import
+                    from . import manager  # local import to avoid cycle
                     if not await manager._ensure_disk_space(qi.event, qi.filename, qi.size):  # type: ignore[attr-defined]
                         return
                     await self._runner(client, qi)
@@ -149,6 +173,34 @@ class DownloadQueue:
             except Exception:  # noqa: BLE001
                 pass
         self.items.clear()
+
+    async def _renumber(self):  # pragma: no cover - UI side-effects
+        """Renumber queued items' messages after a dequeue/cancel.
+
+        Best effort: failures are swallowed to avoid breaking core flow.
+        """
+        async with self._lock:
+            if not self.items:
+                return
+            try:
+                from telethon import Button as button_cls  # imported lazily
+            except Exception:  # noqa: BLE001
+                button_cls = None  # type: ignore
+            # Copy values snapshot to avoid RuntimeError if items mutates while iterating
+            snapshot = list(self.items.values())
+            for idx, qi in enumerate(snapshot, start=1):
+                if not qi.message or qi.cancelled:
+                    continue
+                try:
+                    buttons = None
+                    if button_cls and qi.file_id:
+                        buttons = [[button_cls.inline("🛑 Cancel", data=f"qcancel:{qi.file_id}")]]
+                    await qi.message.edit(
+                        f"🕒 Queued #{idx}: {qi.filename}\nWaiting for free slot (limit {self.limit})",
+                        buttons=buttons,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
 
 
 queue = DownloadQueue(config.MAX_CONCURRENT_DOWNLOADS)

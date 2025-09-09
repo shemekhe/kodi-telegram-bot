@@ -405,8 +405,11 @@ async def _handle_active_duplicate(event, active_state: DownloadState, filename:
             buttons=build_buttons(active_state),
         )
     if active_state.original_event and _same_user(event, active_state.original_event):
-        reply_to_id = active_state.message.id if active_state.message else None
-        await event.respond(f"⏳ Already in progress: {filename}", reply_to=reply_to_id)
+        # Reply directly to the duplicate user's new message (not the existing progress message)
+        await event.respond(
+            f"⏳ Already in progress: {filename}",
+            reply_to=getattr(event, 'id', None),
+        )
     else:
         try:
             mirror_msg = await event.respond(
@@ -434,8 +437,8 @@ async def _handle_queued_duplicate(event, queued_item: QueuedItem, filename: str
 
 async def _enqueue_or_run(client: TelegramClient, document, filename, size, path, event):
     if queue.is_saturated():
-        qi = QueuedItem(filename, document, size, path, event)
         file_id = _register_file_id(filename)
+        qi = QueuedItem(filename, document, size, path, event, file_id=file_id)
         position = await queue.enqueue(qi)
         try:
             msg = await event.respond(
