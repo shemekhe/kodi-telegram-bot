@@ -155,7 +155,7 @@ class DownloadQueue:
             try:
                 if self._runner:
                     from . import manager  # local import to avoid cycle
-                    if not await manager._ensure_disk_space(qi.event, qi.filename, qi.size):  # type: ignore[attr-defined]
+                    if not await manager._ensure_disk_space(qi.event, qi.filename, qi.size, qi.path, from_queue=True):  # type: ignore[attr-defined]
                         return
                     await self._runner(client, qi)
             except Exception:  # noqa: BLE001

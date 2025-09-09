@@ -32,4 +32,5 @@ def test_active_duplicate_replies_to_new_message():
     assert replies, "No reply captured"
     text, reply_to = replies[0]
     assert "Already in progress" in text
-    assert reply_to == 99  # should reply to duplicate event's own id
+    # New behavior: reply is threaded to existing progress message (id 111)
+    assert reply_to == 111

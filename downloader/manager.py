@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+import uuid
 from typing import Callable, Awaitable, Any
 from telethon import events, Button, TelegramClient
 from telethon.tl.types import Document
@@ -26,6 +27,42 @@ file_id_map: dict[str, str] = {}
 _queue_started = False
 
 _NOT_FOUND = "File not found"
+
+# Test hook: when True we auto-accept deletions without interactive prompts.
+TEST_AUTO_ACCEPT = False
+
+
+class PendingDeletion:
+    __slots__ = (
+        "pid",
+        "filename",
+        "target_filename",
+        "target_size",
+        "target_path",
+        "event",
+        "future",
+        "choice",
+        "message",
+        "candidate_path",
+        "from_queue",
+    )
+
+    def __init__(self, pid: str, filename: str, target_filename: str, target_size: int, target_path: str, event, from_queue: bool):
+        loop = asyncio.get_event_loop()
+        self.pid = pid
+        self.filename = filename  # candidate deletion filename (basename)
+        self.target_filename = target_filename  # download we want to start
+        self.target_size = target_size
+        self.target_path = target_path
+        self.event = event
+        self.future: asyncio.Future = loop.create_future()
+        self.choice: str | None = None  # 'yes' | 'no'
+        self.message = None  # telethon message used for prompts
+        self.candidate_path = filename  # full path
+        self.from_queue = from_queue
+
+
+pending_deletions: dict[str, PendingDeletion] = {}
 
 
 def _register_file_id(filename: str) -> str:
@@ -75,7 +112,7 @@ async def pre_checks(event: events.NewMessage.Event, text: str | None = None):
     # final path so duplicates are detected on normalized name.
     path, final_name = build_final_path(filename, text=text)
     filename = final_name  # downstream uses normalized form
-    if not await _ensure_disk_space(event, filename, file_size):
+    if not await _ensure_disk_space(event, filename, file_size, path):
         return None
     # Soft warning if approaching low space threshold
     try:
@@ -105,7 +142,8 @@ async def pre_checks(event: events.NewMessage.Event, text: str | None = None):
             os.remove(path)
         except OSError:
             pass
-    log.info("Re-downloading incomplete file %s", filename)
+        # Only log re-download when we actually detected an incomplete prior file
+        log.info("Re-downloading incomplete file %s", filename)
     return document, filename, file_size, path
 
 
@@ -119,40 +157,144 @@ def _current_reserved_bytes() -> int:
     return sum(st.size for st in states.values())
 
 
-async def _ensure_disk_space(event, filename: str, file_size: int) -> bool:
-    """Ensure that after accounting for active + this download we stay above threshold.
+def _list_files_under(root: str, exclude: set[str]) -> list[tuple[float, str]]:
+    entries: list[tuple[float, str]] = []
+    for r, _d, files in os.walk(root):
+        for f in files:
+            full = os.path.join(r, f)
+            if full in exclude:
+                continue
+            try:
+                m = os.path.getmtime(full)
+            except OSError:
+                continue
+            entries.append((m, full))
+    entries.sort(key=lambda x: x[0])  # oldest first
+    return entries
 
-    Strategy: reserve full size up-front for each running download. This is
-    conservative and simple (no partial progress accounting). Before starting
-    a queued item we re-run this check (see queue runner path below).
+
+def _infer_category_root(path: str) -> str | None:
+    if not config.ORGANIZE_MEDIA:
+        return None
+    movies_root = os.path.join(config.DOWNLOAD_DIR, config.MOVIES_DIR_NAME)
+    series_root = os.path.join(config.DOWNLOAD_DIR, config.SERIES_DIR_NAME)
+    other_root = os.path.join(config.DOWNLOAD_DIR, config.OTHER_DIR_NAME)
+    for root in (movies_root, series_root, other_root):
+        if path.startswith(root + os.sep):
+            return root
+    return None
+
+
+def _select_deletion_candidate(target_path: str, exclude: set[str]) -> str | None:
+    """Return full path of candidate file to delete following selection rules."""
+    if config.ORGANIZE_MEDIA:
+        cat_root = _infer_category_root(target_path)
+        if cat_root:
+            cat_files = _list_files_under(cat_root, exclude)
+            if cat_files:
+                return cat_files[0][1]
+    # Fallback / organization disabled path
+    all_files = _list_files_under(config.DOWNLOAD_DIR, exclude)
+    if all_files:
+        return all_files[0][1]
+    return None
+
+
+async def _ensure_disk_space(event, filename: str, file_size: int, path: str | None = None, from_queue: bool = False) -> bool:  # noqa: PLR0912
+    """Interactive disk space assurance with recursive candidate deletions.
+
+    Holds the concurrency slot (caller acquires it) while waiting for user decision.
+    Timeout 120s -> cancellation. TEST_AUTO_ACCEPT path auto-deletes oldest files.
     """
-    # bytes that would be reserved if this starts now
-    cumulative = _current_reserved_bytes() + file_size
-    projected = _projected_free_mb(cumulative)
-    if projected >= config.MIN_FREE_DISK_MB:
-        return True
-    # Attempt auto-clean to reach: min threshold + this file + current reserved
-    before = utils.free_disk_mb(config.DOWNLOAD_DIR)
-    target = config.MIN_FREE_DISK_MB + int(cumulative / (1024 * 1024))
-    deleted = utils.cleanup_old_files(config.DOWNLOAD_DIR, target)
-    after = utils.free_disk_mb(config.DOWNLOAD_DIR)
-    projected = _projected_free_mb(cumulative)
-    if projected >= config.MIN_FREE_DISK_MB:
-        await event.respond(
-            f"♻️ Auto-clean removed {deleted} file(s) (free {before}MB -> {after}MB). Proceeding."
+    # Reserve expected sizes conservatively
+    target_path = path or os.path.join(config.DOWNLOAD_DIR, filename)
+    while True:
+        cumulative = _current_reserved_bytes() + file_size
+        projected = _projected_free_mb(cumulative)
+        if projected >= config.MIN_FREE_DISK_MB:
+            return True
+        # Need deletions
+        exclude = {st.path for st in states.values()}
+        exclude.add(target_path)
+        candidate = _select_deletion_candidate(target_path, exclude)
+        if not candidate:
+            try:
+                await event.respond(
+                    f"🛑 Storage not enough for {filename} and no deletable files found. Cancelling.",
+                    reply_to=getattr(event, 'id', None),
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            log.error("No candidate for deletion; cancelling %s", filename)
+            return False
+        cand_name = os.path.basename(candidate)
+
+        if TEST_AUTO_ACCEPT:
+            try:
+                os.remove(candidate)
+            except OSError:
+                pass
+            log.debug("[TEST] Auto-deleted %s", candidate)
+            # loop continues to re-evaluate space
+            continue
+
+        # Interactive prompt
+        pid = uuid.uuid4().hex[:8]
+        pending = PendingDeletion(candidate, candidate, filename, file_size, target_path, event, from_queue)
+        pending_deletions[pid] = pending
+        free_now = utils.free_disk_mb(config.DOWNLOAD_DIR)
+        needed_after = config.MIN_FREE_DISK_MB
+        size_h = utils.humanize_size(file_size)
+        text = (
+            f"Storage is not enough to download {filename} (need to reserve {size_h}).\n"
+            f"Free now: {free_now}MB. Need >= {needed_after}MB free AFTER reserving active downloads.\n"
+            f"Delete oldest candidate: {cand_name}?"
         )
-        log.warning(
-            "Auto-clean removed %d files (free %dMB -> %dMB)", deleted, before, after
-        )
-        return True
-    await event.respond(
-        (
-            f"🛑 Not enough disk space for {filename} (projected free {projected}MB) "
-            f"after reserving {utils.humanize_size(cumulative)}. Need >= {config.MIN_FREE_DISK_MB}MB free after all active downloads."
-        )
-    )
-    log.error("Insufficient disk space for %s (projected %dMB)", filename, projected)
-    return False
+        buttons = [[
+            Button.inline("✅ Yes", data=f"delok:{pid}"),
+            Button.inline("❌ No", data=f"delnx:{pid}"),
+        ]]
+        try:
+            pending.message = await event.respond(text, buttons=buttons, reply_to=getattr(event, 'id', None))
+        except Exception:  # noqa: BLE001
+            # If we cannot prompt, abort to avoid hanging
+            pending_deletions.pop(pid, None)
+            return False
+        # Wait for user choice or timeout
+        try:
+            await asyncio.wait_for(pending.future, timeout=120)
+        except asyncio.TimeoutError:
+            # Timeout cancellation
+            try:
+                if pending.message:
+                    await _safe_edit(pending.message, f"🛑 Timed out waiting for confirmation. Cancelled: {filename}")
+            except Exception:  # noqa: BLE001
+                pass
+            pending_deletions.pop(pid, None)
+            log.warning("Deletion prompt timeout for %s", filename)
+            return False
+        choice = pending.choice
+        pending_deletions.pop(pid, None)
+        if choice != 'yes':  # no or unexpected
+            try:
+                if pending.message:
+                    await _safe_edit(pending.message, f"🛑 Cancelled: insufficient space for {filename}")
+            except Exception:  # noqa: BLE001
+                pass
+            log.info("User declined deletion for %s", filename)
+            return False
+        # Perform deletion & loop
+        try:
+            os.remove(candidate)
+        except OSError:
+            pass
+        # Update prompt message to reflect deletion before next loop iteration
+        try:
+            if pending.message:
+                await _safe_edit(pending.message, f"Deleted {cand_name}. Re-checking space...")
+        except Exception:  # noqa: BLE001
+            pass
+        # loop continues
 
 
 async def download_with_retries(
@@ -397,6 +539,7 @@ def _same_user(ev1, ev2):
 
 
 async def _handle_active_duplicate(event, active_state: DownloadState, filename: str):
+    # Resume if paused
     if active_state.paused and not active_state.cancelled:
         active_state.mark_resumed()
         await _safe_edit(
@@ -404,35 +547,64 @@ async def _handle_active_duplicate(event, active_state: DownloadState, filename:
             f"▶ Resuming: {active_state.filename}",
             buttons=build_buttons(active_state),
         )
-    if active_state.original_event and _same_user(event, active_state.original_event):
-        # Reply directly to the duplicate user's new message (not the existing progress message)
-        await event.respond(
-            f"⏳ Already in progress: {filename}",
+    progress_msg = getattr(active_state, 'message', None)
+    reply_target = getattr(progress_msg, 'id', None)
+    # If we still have the original progress message, reply to it so conversation threads visually group.
+    if reply_target:
+        try:
+            # Short distinct text per user relationship (no buttons for duplicate notification)
+            base = "⏳ Already in progress" if active_state.original_event and _same_user(event, active_state.original_event) else "⏳ Already being downloaded"
+            await event.respond(
+                f"{base}: {filename}",
+                reply_to=reply_target,
+            )
+            return
+        except Exception:  # noqa: BLE001
+            pass  # fall through to creating mirror message
+    # Progress message missing (deleted?) – create a new mirror with buttons and start mirroring further updates
+    try:
+        mirror_msg = await event.respond(
+            f"⏳ Already being downloaded: {filename}. You'll receive progress here.",
             reply_to=getattr(event, 'id', None),
         )
-    else:
-        try:
-            mirror_msg = await event.respond(
-                f"⏳ Already being downloaded: {filename}. You'll receive progress here.",
-                reply_to=getattr(event, 'id', None),
-            )
-            active_state.extra_messages.append(mirror_msg)
-        except Exception:  # noqa: BLE001
-            pass
+        active_state.extra_messages.append(mirror_msg)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 async def _handle_queued_duplicate(event, queued_item: QueuedItem, filename: str):
-    if queued_item.event and _same_user(event, queued_item.event):
-        await event.respond(f"🕒 Already queued: {filename}", reply_to=getattr(event, 'id', None))
-    else:
+    # If we still have the queued placeholder message, reply to it; otherwise recreate.
+    queued_msg = getattr(queued_item, 'message', None)
+    reply_target = getattr(queued_msg, 'id', None)
+    same = queued_item.event and _same_user(event, queued_item.event)
+    if reply_target:
         try:
             await event.respond(
-                f"🕒 {filename} is queued. You'll receive progress here when it starts.",
-                reply_to=getattr(event, 'id', None),
+                f"🕒 Already queued: {filename}",
+                reply_to=reply_target,
             )
-            queued_item.add_watcher(event)
+            if not same:
+                queued_item.add_watcher(event)
+            return
         except Exception:  # noqa: BLE001
-            pass
+            pass  # recreate below
+    # Recreate queued message (position unknown now) if original missing
+    if not queued_item.file_id:
+        from .ids import get_file_id as _gf
+        queued_item.file_id = _gf(filename)
+    try:
+        msg = await event.respond(
+            f"🕒 Queued: {filename}\nWaiting for free slot (limit {config.MAX_CONCURRENT_DOWNLOADS})",
+            buttons=[[Button.inline("🛑 Cancel", data=f"qcancel:{queued_item.file_id}")]],
+            reply_to=getattr(event, 'id', None),
+        )
+        # Don't overwrite existing if it somehow reappears; only set if missing
+        if not queued_item.message:
+            queued_item.message = msg
+        if not same:
+            queued_item.add_watcher(event)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 async def _enqueue_or_run(client: TelegramClient, document, filename, size, path, event):
@@ -454,7 +626,7 @@ async def _enqueue_or_run(client: TelegramClient, document, filename, size, path
             pass
         return
     async with queue.slot():  # pragma: no cover - thin wrapper
-        if not await _ensure_disk_space(event, filename, size):
+        if not await _ensure_disk_space(event, filename, size, path):
             return
         await run_download(client, event, document, filename, size, path)
 
@@ -580,6 +752,7 @@ def _register_control_callbacks(client: TelegramClient):
     _register_pause_resume_cancel(client)
     _register_qcancel(client)
     _register_category_selection(client)
+    _register_deletion_callbacks(client)
 
 
 def _register_pause_resume_cancel(client: TelegramClient):
@@ -649,8 +822,35 @@ def _register_qcancel(client: TelegramClient):
         await event.answer("Cancelled")
 
 
+def _register_deletion_callbacks(client: TelegramClient):
+    pattern = b"del(ok|nx):"
+
+    @client.on(events.CallbackQuery(pattern=pattern))
+    async def _del(event):  # noqa: D401
+        data = event.data.decode()
+        action, pid = data.split(":", 1)
+        pending = pending_deletions.get(pid)
+        if not pending:
+            await event.answer(_NOT_FOUND, alert=False)
+            return
+        if pending.future.done():  # Already decided
+            await event.answer("Already processed", alert=False)
+            return
+        if action == "delok":
+            pending.choice = 'yes'
+            await event.answer("Deleting", alert=False)
+        else:
+            pending.choice = 'no'
+            await event.answer("Cancelled", alert=False)
+        try:
+            pending.future.set_result(True)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _register_category_selection(client: TelegramClient):
-    @client.on(events.CallbackQuery(pattern=b"cat[ms|o]:"))
+    # Accept only the three explicit prefixes: catm / cats / cato
+    @client.on(events.CallbackQuery(pattern=b"cat[mso]:"))
     async def _cat(event):  # noqa: D401
         data = event.data.decode()
         prefix, file_id = data.split(":", 1)
@@ -675,7 +875,7 @@ def _register_category_selection(client: TelegramClient):
             await event.answer("Already queued", alert=False)
             return
         # Quick disk check: reuse logic
-        if not await _ensure_disk_space(event, final_name, size):
+        if not await _ensure_disk_space(event, final_name, size, path):
             return
         # Enqueue/run directly
         await _enqueue_or_run(client, fake_document, final_name, size, path, orig_event)

@@ -81,8 +81,14 @@ def _env_int(name: str, default: int) -> int:
 
 def get_logger() -> logging.Logger:
     logger = logging.getLogger("kodi_telegram_bot")
-    if logger.handlers:  # Already configured
-        return logger
+    if logger.handlers:  # Already configured (maybe from previous import)
+        # If reloaded module created a *new* TruncatingFileHandler class, existing
+        # handler instances won't pass isinstance checks. Ensure at least one
+        # handler named TruncatingFileHandler is present; if not, add a fresh one.
+        has_trunc = any(h.__class__.__name__ == "TruncatingFileHandler" for h in logger.handlers)
+        if has_trunc:
+            return logger
+        # Fall through to (re)configure a file handler while preserving existing stderr handlers.
 
     level_name = os.getenv("LOG_LEVEL", "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
@@ -103,11 +109,12 @@ def get_logger() -> logging.Logger:
     logger.addHandler(handler)
     logger.propagate = False
 
-    # Also echo INFO+ to stderr for operational visibility (optional)
-    stderr_handler = logging.StreamHandler()
-    stderr_handler.setLevel(level)
-    stderr_handler.setFormatter(logging.Formatter(fmt, datefmt=datefmt))
-    logger.addHandler(stderr_handler)
+    # Add stderr handler only if one not already present (avoid duplicates on reload)
+    if not any(isinstance(h, logging.StreamHandler) and not isinstance(h, TruncatingFileHandler) for h in logger.handlers):
+        stderr_handler = logging.StreamHandler()
+        stderr_handler.setLevel(level)
+        stderr_handler.setFormatter(logging.Formatter(fmt, datefmt=datefmt))
+        logger.addHandler(stderr_handler)
 
     logger.debug(
         "Logger initialized (file=%s, max_mb=%s, level=%s)", log_file, max_mb, level_name
