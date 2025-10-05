@@ -26,7 +26,7 @@ Lightweight Telegram bot that downloads video / audio you send it and plays the 
 
 ## 1. What It Does
 
-Private‑chat the bot a media file (video/audio). It:
+Send the bot a media file (video or audio). It:
 1. Validates it looks like playable media.
 2. Ensures post‑download free disk space stays above a safety threshold (auto‑clean oldest files if needed).
 3. Queues or starts download (with concurrency limit).
